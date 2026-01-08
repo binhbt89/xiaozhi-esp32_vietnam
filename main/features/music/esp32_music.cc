@@ -11,103 +11,20 @@
 #include <esp_heap_caps.h>
 #include <esp_pthread.h>
 #include <esp_timer.h>
-#include <mbedtls/sha256.h>
 #include <cJSON.h>
 #include <cstring>
 #include <chrono>
 #include <sstream>
 #include <algorithm>
-#include <cctype>  // For isdigit function
-#include <thread>   // For thread ID comparison
+#include <cctype>
+#include <thread>
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
 
 #define TAG "Esp32Music"
 
-// std::string base_url = "http://www.xiaozhishop.xyz:5005";
-// Example: http://www.xiaozhishop.xyz:5005/stream_pcm?song=Con%20mua%20bang%20gia&artist=Bang%20Kieu
-// For local server testing, you should change to your own server address
-#define DEFAULT_MUSIC_URL "http://www.xiaozhishop.xyz:5005"
-
-// ========== Simple ESP32 Authentication Function ==========
-
-/**
- * @brief Get device MAC address
- * @return MAC address string
- */
-static std::string get_device_mac() {
-    return SystemInfo::GetMacAddress();
-}
-
-/**
- * @brief Get device chip ID
- * @return Chip ID string
- */
-static std::string get_device_chip_id() {
-    // Use MAC address as chip ID, remove colon separators
-    std::string mac = SystemInfo::GetMacAddress();
-    // Remove all colons
-    mac.erase(std::remove(mac.begin(), mac.end(), ':'), mac.end());
-    return mac;
-}
-
-/**
- * @brief Generate dynamic key
- * @param timestamp Timestamp
- * @return Dynamic key string
- */
-static std::string generate_dynamic_key(int64_t timestamp) {
-    // Secret key (please modify to match the server)
-    const std::string secret_key = "your-esp32-secret-key-2024";
-    
-    // Get device information
-    std::string mac = get_device_mac();
-    std::string chip_id = get_device_chip_id();
-    
-    // Combine data: MAC:Chip ID:Timestamp:Secret Key
-    std::string data = mac + ":" + chip_id + ":" + std::to_string(timestamp) + ":" + secret_key;
-    
-    // SHA256 hash
-    unsigned char hash[32];
-    mbedtls_sha256((unsigned char*)data.c_str(), data.length(), hash, 0);
-    
-    // Convert to hexadecimal string (first 16 bytes)
-    std::string key;
-    for (int i = 0; i < 16; i++) {
-        char hex[3];
-        snprintf(hex, sizeof(hex), "%02X", hash[i]);
-        key += hex;
-    }
-    
-    return key;
-}
-
-/**
- * @brief Add authentication headers to HTTP request
- * @param http HTTP client pointer
- */
-static void add_auth_headers(Http* http) {
-    // Get current timestamp
-    int64_t timestamp = esp_timer_get_time() / 1000000;  // Convert to seconds
-    
-    // Generate dynamic key
-    std::string dynamic_key = generate_dynamic_key(timestamp);
-    
-    // Get device information
-    std::string mac = get_device_mac();
-    std::string chip_id = get_device_chip_id();
-    
-    // Add authentication headers
-    if (http) {
-        http->SetHeader("X-MAC-Address", mac);
-        http->SetHeader("X-Chip-ID", chip_id);
-        http->SetHeader("X-Timestamp", std::to_string(timestamp));
-        http->SetHeader("X-Dynamic-Key", dynamic_key);
-        
-        ESP_LOGI(TAG, "Added auth headers - MAC: %s, ChipID: %s, Timestamp: %lld", 
-                 mac.c_str(), chip_id.c_str(), timestamp);
-    }
-}
+// Default ZingMP3 server URL - CHANGE THIS TO YOUR SERVER IP
+#define DEFAULT_ZINGMP3_URL "http://192.168.1.100:5555"
 
 // URL encoding function
 static std::string url_encode(const std::string& str) {
@@ -123,7 +40,7 @@ static std::string url_encode(const std::string& str) {
             c == '-' || c == '_' || c == '.' || c == '~') {
             encoded += c;
         } else if (c == ' ') {
-            encoded += '+';  // Space encoded as '+' or '%20'
+            encoded += '+';
         } else {
             snprintf(hex, sizeof(hex), "%%%02X", c);
             encoded += hex;
@@ -132,53 +49,43 @@ static std::string url_encode(const std::string& str) {
     return encoded;
 }
 
-// Add a helper function at the beginning of the file to handle URL construction
-static std::string buildUrlWithParams(const std::string& base_url, const std::string& path, const std::string& query) {
-    std::string result_url = base_url + path + "?";
-    size_t pos = 0;
-    size_t amp_pos = 0;
+Esp32Music::Esp32Music() 
+    : zingmp3_server_url_(DEFAULT_ZINGMP3_URL),
+      last_downloaded_data_(), 
+      current_music_url_(), 
+      current_song_id_(),
+      current_song_info_(),
+      song_name_displayed_(false),
+      full_info_displayed_(false),
+      fft_started_(false),
+      preferred_quality_(QUALITY_128),
+      current_lyric_url_(), 
+      lyrics_(), 
+      current_lyric_index_(-1), 
+      lyric_thread_(), 
+      is_lyric_running_(false),
+      display_mode_(DISPLAY_MODE_SPECTRUM), 
+      is_playing_(false), 
+      is_downloading_(false), 
+      play_thread_(), 
+      download_thread_(), 
+      audio_buffer_(), 
+      buffer_mutex_(), 
+      buffer_cv_(), 
+      buffer_size_(0), 
+      mp3_decoder_(nullptr), 
+      mp3_frame_info_(), 
+      mp3_decoder_initialized_(false),
+      current_play_time_ms_(0),
+      last_frame_time_ms_(0),
+      total_frames_decoded_(0) {
     
-    while ((amp_pos = query.find("&", pos)) != std::string::npos) {
-        std::string param = query.substr(pos, amp_pos - pos);
-        size_t eq_pos = param.find("=");
-        
-        if (eq_pos != std::string::npos) {
-            std::string key = param.substr(0, eq_pos);
-            std::string value = param.substr(eq_pos + 1);
-            result_url += key + "=" + url_encode(value) + "&";
-        } else {
-            result_url += param + "&";
-        }
-        
-        pos = amp_pos + 1;
-    }
-    
-    // Process the last parameter
-    std::string last_param = query.substr(pos);
-    size_t eq_pos = last_param.find("=");
-    
-    if (eq_pos != std::string::npos) {
-        std::string key = last_param.substr(0, eq_pos);
-        std::string value = last_param.substr(eq_pos + 1);
-        result_url += key + "=" + url_encode(value);
-    } else {
-        result_url += last_param;
-    }
-    
-    return result_url;
-}
-
-Esp32Music::Esp32Music() : last_downloaded_data_(), current_music_url_(), current_song_name_(),
-                         song_name_displayed_(false), current_lyric_url_(), lyrics_(), 
-                         current_lyric_index_(-1), lyric_thread_(), is_lyric_running_(false),
-                         display_mode_(DISPLAY_MODE_SPECTRUM), is_playing_(false), is_downloading_(false), 
-                         play_thread_(), download_thread_(), audio_buffer_(), buffer_mutex_(), 
-                         buffer_cv_(), buffer_size_(0), mp3_decoder_(nullptr), mp3_frame_info_(), 
-                         mp3_decoder_initialized_(false) {
+    // Load server URL from settings using GetCheckMusicServerUrl()
+    // Note: GetCheckMusicServerUrl() will be called when needed, not in constructor
 }
 
 Esp32Music::~Esp32Music() {
-    ESP_LOGI(TAG, "Destroying music player - stopping all operations");
+    ESP_LOGI(TAG, "Destroying ZingMP3 player - stopping all operations");
     
     // Stop all operations
     is_downloading_ = false;
@@ -191,462 +98,457 @@ Esp32Music::~Esp32Music() {
         buffer_cv_.notify_all();
     }
     
-    // Wait for download thread to finish with 5-second timeout
+    // Wait for download thread
     if (download_thread_.joinable()) {
-        ESP_LOGI(TAG, "Waiting for download thread to finish (timeout: 5s)");
-        auto start_time = std::chrono::steady_clock::now();
-        
-        // Wait for thread to finish
-        bool thread_finished = false;
-        while (!thread_finished) {
-            std::this_thread::sleep_for(std::chrono::milliseconds(100));
-            auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(
-                std::chrono::steady_clock::now() - start_time).count();
-            
-            if (elapsed >= 5) {
-                ESP_LOGW(TAG, "Download thread join timeout after 5 seconds");
-                break;
-            }
-            
-            // Set stop flag again to ensure thread can detect it
-            is_downloading_ = false;
-            
-            // Notify condition variable
-            {
-                std::lock_guard<std::mutex> lock(buffer_mutex_);
-                buffer_cv_.notify_all();
-            }
-            
-            // Check if the thread has already finished
-            if (!download_thread_.joinable()) {
-                thread_finished = true;
-            }
-            
-            // Periodically print waiting information
-            if (elapsed > 0 && elapsed % 1 == 0) {
-                ESP_LOGI(TAG, "Still waiting for download thread to finish... (%ds)", (int)elapsed);
-            }
-        }
-        
-        if (download_thread_.joinable()) {
-            download_thread_.join();
-        }
-        ESP_LOGI(TAG, "Download thread finished");
+        ESP_LOGI(TAG, "Waiting for download thread to finish");
+        download_thread_.join();
     }
     
-    // Wait for the playback thread to finish, with a 3-second timeout
+    // Wait for playback thread
     if (play_thread_.joinable()) {
-        ESP_LOGI(TAG, "Waiting for playback thread to finish (timeout: 3s)");
-        auto start_time = std::chrono::steady_clock::now();
-        
-        bool thread_finished = false;
-        while (!thread_finished) {
-            std::this_thread::sleep_for(std::chrono::milliseconds(50));
-            auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(
-                std::chrono::steady_clock::now() - start_time).count();
-            
-            if (elapsed >= 3) {
-                ESP_LOGW(TAG, "Playback thread join timeout after 3 seconds");
-                break;
-            }
-            
-            // Set the stop flag again
-            is_playing_ = false;
-            
-            // Notify the condition variable
-            {
-                std::lock_guard<std::mutex> lock(buffer_mutex_);
-                buffer_cv_.notify_all();
-            }
-            
-            // Check if the thread has already finished
-            if (!play_thread_.joinable()) {
-                thread_finished = true;
-            }
-        }
-        
-        if (play_thread_.joinable()) {
-            play_thread_.join();
-        }
-        ESP_LOGI(TAG, "Playback thread finished");
+        ESP_LOGI(TAG, "Waiting for playback thread to finish");
+        play_thread_.join();
     }
     
-    // Wait for the lyric thread to finish
+    // Wait for lyric thread
     if (lyric_thread_.joinable()) {
         ESP_LOGI(TAG, "Waiting for lyric thread to finish");
         lyric_thread_.join();
-        ESP_LOGI(TAG, "Lyric thread finished");
     }
     
-    // Clear the buffer and MP3 decoder
+    // Clear buffer and decoder
     ClearAudioBuffer();
     CleanupMp3Decoder();
     
-    ESP_LOGI(TAG, "Music player destroyed successfully");
+    ESP_LOGI(TAG, "ZingMP3 player destroyed successfully");
 }
 
 void Esp32Music::Initialize() {
-    ESP_LOGI(TAG, "Initializing music player");
-    // InitializeMp3Decoder();
+    ESP_LOGI(TAG, "Initializing ZingMP3 player");
+    // Get server URL from settings
+    zingmp3_server_url_ = GetCheckMusicServerUrl();
+    ESP_LOGI(TAG, "Server URL: %s", zingmp3_server_url_.c_str());
 }
 
-bool Esp32Music::Download(const std::string& song_name, const std::string& artist_name) {
-    ESP_LOGI(TAG, "Starting to get music details for: %s", song_name.c_str());
+std::string Esp32Music::GetQualityString(AudioQuality quality) {
+    switch (quality) {
+        case QUALITY_128: return "128";
+        case QUALITY_320: return "320";
+        case QUALITY_LOSSLESS: return "lossless";
+        default: return "128";
+    }
+}
+
+bool Esp32Music::SearchSong(const std::string& query, SongInfo& song_info) {
+    ESP_LOGI(TAG, "Searching for: %s", query.c_str());
     
-    // Clear previous download state
-    last_downloaded_data_.clear();
-    title_name_.clear();
-    artist_name_.clear();
-    current_song_name_ = song_name;
+    std::string search_url = zingmp3_server_url_ + "/api/search?q=" + url_encode(query);
+    ESP_LOGI(TAG, "Search URL: %s", search_url.c_str());
     
-    // Step 1: Request the stream_pcm API to retrieve audio information
-    std::string base_url = GetCheckMusicServerUrl();
-    std::string full_url = base_url + "/stream_pcm?song=" + url_encode(song_name) + "&artist=" + url_encode(artist_name);
-    
-    ESP_LOGI(TAG, "Request URL: %s", full_url.c_str());
-    
-    // Use the HTTP client provided by the Board
     auto network = Board::GetInstance().GetNetwork();
     auto http = network->CreateHttp(0);
     
-    // Set basic request headers
-    http->SetHeader("User-Agent", "ESP32-Music-Player/1.0");
+    http->SetHeader("User-Agent", "ESP32-ZingMP3-Player/1.0");
     http->SetHeader("Accept", "application/json");
     
-    // Add ESP32 authentication headers
-    add_auth_headers(http.get());
-    
-    // Open GET connection
-    if (!http->Open("GET", full_url)) {
-        ESP_LOGE(TAG, "Failed to connect to music API");
+    if (!http->Open("GET", search_url)) {
+        ESP_LOGE(TAG, "Failed to connect to ZingMP3 search API");
         return false;
     }
     
-    // Check the response status code
     int status_code = http->GetStatusCode();
     if (status_code != 200) {
-        ESP_LOGE(TAG, "HTTP GET failed with status code: %d", status_code);
+        ESP_LOGE(TAG, "Search API failed with status: %d", status_code);
         http->Close();
         return false;
     }
     
-    // Read the response data
-    last_downloaded_data_ = http->ReadAll();
+    std::string response = http->ReadAll();
     http->Close();
     
-    ESP_LOGI(TAG, "HTTP GET Status = %d, content_length = %d", status_code, last_downloaded_data_.length());
-    ESP_LOGD(TAG, "Complete music details response: %s", last_downloaded_data_.c_str());
+    ESP_LOGD(TAG, "Search response: %s", response.c_str());
     
-    // Simple authentication response check (optional)
-    if (last_downloaded_data_.find("ESP32动态密钥验证失败") != std::string::npos) {
-        ESP_LOGE(TAG, "Authentication failed for song: %s", song_name.c_str());
+    // Parse JSON response
+    cJSON* json = cJSON_Parse(response.c_str());
+    if (!json) {
+        ESP_LOGE(TAG, "Failed to parse search response JSON");
         return false;
     }
     
-    if (!last_downloaded_data_.empty()) {
-        // Parse the response JSON to extract the audio URL
-        cJSON* response_json = cJSON_Parse(last_downloaded_data_.c_str());
-        if (response_json) {
-            // Extract key information
-            cJSON* artist = cJSON_GetObjectItem(response_json, "artist");
-            cJSON* title = cJSON_GetObjectItem(response_json, "title");
-            cJSON* audio_url = cJSON_GetObjectItem(response_json, "audio_url");
-            cJSON* lyric_url = cJSON_GetObjectItem(response_json, "lyric_url");
+    bool found = false;
+    cJSON* data = cJSON_GetObjectItem(json, "data");
+    if (data) {
+        // Try to get top result first
+        cJSON* top = cJSON_GetObjectItem(data, "top");
+        if (top && cJSON_IsObject(top)) {
+            cJSON* id = cJSON_GetObjectItem(top, "encodeId");
+            cJSON* title = cJSON_GetObjectItem(top, "title");
+            cJSON* artist = cJSON_GetObjectItem(top, "artistsNames");
             
-            if (cJSON_IsString(artist)) {
-                ESP_LOGI(TAG, "Artist: %s", artist->valuestring);
+            if (cJSON_IsString(id) && id->valuestring) {
+                song_info.encodeId = id->valuestring;
+                if (cJSON_IsString(title)) song_info.title = title->valuestring;
+                if (cJSON_IsString(artist)) song_info.artist = artist->valuestring;
+                found = true;
+                ESP_LOGI(TAG, "Found top result: %s - %s (ID: %s)", 
+                         song_info.title.c_str(), song_info.artist.c_str(), song_info.encodeId.c_str());
             }
-            if (cJSON_IsString(artist)) {
-                artist_name_ = artist->valuestring;    
-            }
-            if (cJSON_IsString(title)) {
-                title_name_ = title->valuestring;      
-            }
-            
-            // Hiển thị thông tin bài hát sớm, trước khi phát (nếu có LCD)
-            if (display_mode_ == DISPLAY_MODE_SPECTRUM) {
-                auto display = Board::GetInstance().GetDisplay();
-                if (display) {
-                    char buf[256];
-                    snprintf(buf, sizeof(buf),
-                             "ONLINE 《%s》\n%s • Đang phát...",
-                             title_name_.empty() ? song_name.c_str() : title_name_.c_str(),
-                             artist_name_.empty() ? "Unknown Artist" : artist_name_.c_str());
-
-                    display->SetMusicInfo(buf);
-                    ESP_LOGI(TAG, "[PATCH] Early SetMusicInfo: %s", buf);
-                }
-            }
-        
-            if (cJSON_IsString(title)) {
-                ESP_LOGI(TAG, "Title: %s", title->valuestring);
-            }
-            
-            // Check if audio_url is valid
-            if (cJSON_IsString(audio_url) && audio_url->valuestring && strlen(audio_url->valuestring) > 0) {
-                ESP_LOGI(TAG, "Audio URL path: %s", audio_url->valuestring);
-                
-                // Step 2: Construct the complete audio download URL, ensuring URL encoding for audio_url
-                std::string audio_path = audio_url->valuestring;
-                
-                // Use a unified URL construction function
-                if (audio_path.find("?") != std::string::npos) {
-                    size_t query_pos = audio_path.find("?");
-                    std::string path = audio_path.substr(0, query_pos);
-                    std::string query = audio_path.substr(query_pos + 1);
-                    
-                    current_music_url_ = buildUrlWithParams(base_url, path, query);
-                } else {
-                    current_music_url_ = base_url + audio_path;
-                }
-                
-                ESP_LOGI(TAG, "Starting streaming playback for: %s", song_name.c_str());
-                song_name_displayed_ = false; 
-                full_info_displayed_ = false;
-                
-                StartStreaming(current_music_url_);
-
-                
-                // Handle lyric URL - only start lyrics in lyric display mode
-                if (cJSON_IsString(lyric_url) && lyric_url->valuestring && strlen(lyric_url->valuestring) > 0) {
-                    // Construct the complete lyric download URL using the same URL building logic
-                    std::string lyric_path = lyric_url->valuestring;
-                    if (lyric_path.find("?") != std::string::npos) {
-                        size_t query_pos = lyric_path.find("?");
-                        std::string path = lyric_path.substr(0, query_pos);
-                        std::string query = lyric_path.substr(query_pos + 1);
-                        
-                        current_lyric_url_ = buildUrlWithParams(base_url, path, query);
-                    } else {
-                        current_lyric_url_ = base_url + lyric_path;
-                    }
-                    
-                    // Decide whether to start lyrics based on the display mode
-                    if (display_mode_ == DISPLAY_MODE_LYRICS) {
-                        ESP_LOGI(TAG, "Loading lyrics for: %s (lyrics display mode)", song_name.c_str());
-                        
-                        // Start lyric download and display
-                        if (is_lyric_running_) {
-                            is_lyric_running_ = false;
-                            if (lyric_thread_.joinable()) {
-                                lyric_thread_.join();
-                            }
-                        }
-                        
-                        is_lyric_running_ = true;
-                        current_lyric_index_ = -1;
-                        lyrics_.clear();
-                        
-                        lyric_thread_ = std::thread(&Esp32Music::LyricDisplayThread, this);
-                    } else {
-                        ESP_LOGI(TAG, "Lyric URL found but spectrum display mode is active, skipping lyrics");
-                    }
-                } else {
-                    ESP_LOGW(TAG, "No lyric URL found for this song");
-                }
-                
-                cJSON_Delete(response_json);
-                return true;
-            } else {
-                // audio_url is empty or invalid
-                ESP_LOGE(TAG, "Audio URL not found or empty for song: %s", song_name.c_str());
-                ESP_LOGE(TAG, "Failed to find music: 没有找到歌曲 '%s'", song_name.c_str());
-                cJSON_Delete(response_json);
-                return false;
-            }
-        } else {
-            ESP_LOGE(TAG, "Failed to parse JSON response");
         }
-    } else {
-        ESP_LOGE(TAG, "Empty response from music API");
+        
+        // If no top result, try songs array
+        if (!found) {
+            cJSON* songs = cJSON_GetObjectItem(data, "songs");
+            if (cJSON_IsArray(songs) && cJSON_GetArraySize(songs) > 0) {
+                cJSON* first_song = cJSON_GetArrayItem(songs, 0);
+                if (first_song) {
+                    cJSON* id = cJSON_GetObjectItem(first_song, "encodeId");
+                    cJSON* title = cJSON_GetObjectItem(first_song, "title");
+                    cJSON* artist = cJSON_GetObjectItem(first_song, "artistsNames");
+                    
+                    if (cJSON_IsString(id) && id->valuestring) {
+                        song_info.encodeId = id->valuestring;
+                        if (cJSON_IsString(title)) song_info.title = title->valuestring;
+                        if (cJSON_IsString(artist)) song_info.artist = artist->valuestring;
+                        found = true;
+                        ESP_LOGI(TAG, "Found in songs: %s - %s (ID: %s)", 
+                                 song_info.title.c_str(), song_info.artist.c_str(), song_info.encodeId.c_str());
+                    }
+                }
+            }
+        }
     }
     
-    return false;
+    cJSON_Delete(json);
+    
+    if (!found) {
+        ESP_LOGE(TAG, "No songs found for query: %s", query.c_str());
+    }
+    
+    return found;
 }
 
+bool Esp32Music::GetSongInfo(const std::string& song_id, SongInfo& song_info) {
+    ESP_LOGI(TAG, "Getting song info for ID: %s", song_id.c_str());
+    
+    std::string info_url = zingmp3_server_url_ + "/api/info-song?id=" + song_id;
+    
+    auto network = Board::GetInstance().GetNetwork();
+    auto http = network->CreateHttp(0);
+    
+    http->SetHeader("User-Agent", "ESP32-ZingMP3-Player/1.0");
+    http->SetHeader("Accept", "application/json");
+    
+    if (!http->Open("GET", info_url)) {
+        ESP_LOGE(TAG, "Failed to connect to song info API");
+        return false;
+    }
+    
+    int status_code = http->GetStatusCode();
+    if (status_code != 200) {
+        ESP_LOGE(TAG, "Song info API failed with status: %d", status_code);
+        http->Close();
+        return false;
+    }
+    
+    std::string response = http->ReadAll();
+    http->Close();
+    
+    // Parse JSON
+    cJSON* json = cJSON_Parse(response.c_str());
+    if (!json) {
+        ESP_LOGE(TAG, "Failed to parse song info JSON");
+        return false;
+    }
+    
+    bool success = false;
+    cJSON* data = cJSON_GetObjectItem(json, "data");
+    if (data) {
+        cJSON* title = cJSON_GetObjectItem(data, "title");
+        cJSON* artist = cJSON_GetObjectItem(data, "artistsNames");
+        cJSON* duration = cJSON_GetObjectItem(data, "duration");
+        cJSON* thumbnail = cJSON_GetObjectItem(data, "thumbnailM");
+        
+        song_info.encodeId = song_id;
+        if (cJSON_IsString(title)) song_info.title = title->valuestring;
+        if (cJSON_IsString(artist)) song_info.artist = artist->valuestring;
+        if (cJSON_IsNumber(duration)) song_info.duration = duration->valueint;
+        if (cJSON_IsString(thumbnail)) song_info.thumbnailUrl = thumbnail->valuestring;
+        
+        ESP_LOGI(TAG, "Song info: %s - %s (%ds)", 
+                 song_info.title.c_str(), song_info.artist.c_str(), song_info.duration);
+        success = true;
+    }
+    
+    cJSON_Delete(json);
+    return success;
+}
 
+bool Esp32Music::GetStreamUrl(const std::string& song_id, AudioQuality quality, std::string& stream_url) {
+    ESP_LOGI(TAG, "Getting stream URL for ID: %s, quality: %s", 
+             song_id.c_str(), GetQualityString(quality).c_str());
+    
+    std::string api_url = zingmp3_server_url_ + "/api/song?id=" + song_id;
+    
+    auto network = Board::GetInstance().GetNetwork();
+    auto http = network->CreateHttp(0);
+    
+    http->SetHeader("User-Agent", "ESP32-ZingMP3-Player/1.0");
+    http->SetHeader("Accept", "application/json");
+    
+    if (!http->Open("GET", api_url)) {
+        ESP_LOGE(TAG, "Failed to connect to song API");
+        return false;
+    }
+    
+    int status_code = http->GetStatusCode();
+    if (status_code != 200) {
+        ESP_LOGE(TAG, "Song API failed with status: %d", status_code);
+        http->Close();
+        return false;
+    }
+    
+    std::string response = http->ReadAll();
+    http->Close();
+    
+    // Parse JSON
+    cJSON* json = cJSON_Parse(response.c_str());
+    if (!json) {
+        ESP_LOGE(TAG, "Failed to parse song stream JSON");
+        return false;
+    }
+    
+    bool success = false;
+    cJSON* data = cJSON_GetObjectItem(json, "data");
+    if (data) {
+        std::string quality_key = GetQualityString(quality);
+        cJSON* url_item = cJSON_GetObjectItem(data, quality_key.c_str());
+        
+        if (cJSON_IsString(url_item) && url_item->valuestring && strlen(url_item->valuestring) > 0) {
+            stream_url = url_item->valuestring;
+            ESP_LOGI(TAG, "Got stream URL for quality %s", quality_key.c_str());
+            success = true;
+        } else {
+            // Try fallback to 128kbps if requested quality not available
+            if (quality != QUALITY_128) {
+                ESP_LOGW(TAG, "Quality %s not available, trying 128kbps", quality_key.c_str());
+                url_item = cJSON_GetObjectItem(data, "128");
+                if (cJSON_IsString(url_item) && url_item->valuestring && strlen(url_item->valuestring) > 0) {
+                    stream_url = url_item->valuestring;
+                    ESP_LOGI(TAG, "Using 128kbps fallback");
+                    success = true;
+                }
+            }
+        }
+    }
+    
+    cJSON_Delete(json);
+    
+    if (!success) {
+        ESP_LOGE(TAG, "No stream URL found for song ID: %s", song_id.c_str());
+    }
+    
+    return success;
+}
+
+bool Esp32Music::Download(const std::string& song_name, const std::string& artist_name) {
+    ESP_LOGI(TAG, "Download request: %s - %s", song_name.c_str(), artist_name.c_str());
+    
+    // Clear previous state
+    last_downloaded_data_.clear();
+    current_song_id_.clear();
+    current_song_info_ = SongInfo();
+    
+    // Step 1: Search for the song
+    std::string search_query = song_name;
+    if (!artist_name.empty()) {
+        search_query += " " + artist_name;
+    }
+    
+    SongInfo search_result;
+    if (!SearchSong(search_query, search_result)) {
+        ESP_LOGE(TAG, "Failed to find song: %s", search_query.c_str());
+        return false;
+    }
+    
+    current_song_id_ = search_result.encodeId;
+    
+    // Step 2: Get detailed song info
+    if (!GetSongInfo(current_song_id_, current_song_info_)) {
+        ESP_LOGW(TAG, "Failed to get detailed song info, using search result");
+        current_song_info_ = search_result;
+    }
+    
+    // Step 3: Get stream URL
+    std::string stream_url;
+    if (!GetStreamUrl(current_song_id_, preferred_quality_, stream_url)) {
+        ESP_LOGE(TAG, "Failed to get stream URL");
+        return false;
+    }
+    
+    current_music_url_ = stream_url;
+    
+    // Display song info early
+    if (display_mode_ == DISPLAY_MODE_SPECTRUM) {
+        auto display = Board::GetInstance().GetDisplay();
+        if (display) {
+            char buf[256];
+            snprintf(buf, sizeof(buf),
+                     "ZINGMP3 《%s》\n%s • Đang phát...",
+                     current_song_info_.title.c_str(),
+                     current_song_info_.artist.c_str());
+            display->SetMusicInfo(buf);
+            ESP_LOGI(TAG, "Early display: %s", buf);
+        }
+    }
+    
+    // Step 4: Start streaming
+    ESP_LOGI(TAG, "Starting playback: %s - %s", 
+             current_song_info_.title.c_str(), current_song_info_.artist.c_str());
+    song_name_displayed_ = false;
+    full_info_displayed_ = false;
+    
+    StartStreaming(current_music_url_);
+    
+    // Step 5: Get lyrics if in lyric mode
+    if (display_mode_ == DISPLAY_MODE_LYRICS) {
+        ESP_LOGI(TAG, "Loading lyrics for song ID: %s", current_song_id_.c_str());
+        
+        if (is_lyric_running_) {
+            is_lyric_running_ = false;
+            if (lyric_thread_.joinable()) {
+                lyric_thread_.join();
+            }
+        }
+        
+        is_lyric_running_ = true;
+        current_lyric_index_ = -1;
+        lyrics_.clear();
+        
+        lyric_thread_ = std::thread(&Esp32Music::LyricDisplayThread, this);
+    }
+    
+    return true;
+}
 
 std::string Esp32Music::GetDownloadResult() {
     return last_downloaded_data_;
 }
 
-// Start streaming playback
 bool Esp32Music::StartStreaming(const std::string& music_url) {
     if (music_url.empty()) {
         ESP_LOGE(TAG, "Music URL is empty");
         return false;
     }
     
-    ESP_LOGD(TAG, "Starting streaming for URL: %s", music_url.c_str());
+    ESP_LOGI(TAG, "Starting streaming: %s", music_url.c_str());
     
-    // Stop previous playback and download
+    // Stop previous playback
     is_downloading_ = false;
     is_playing_ = false;
     
-    // ================== DỌN FFT CŨ + RESET FLAG ==================
+    // Clear FFT and reset flags
     {
         auto display = Board::GetInstance().GetDisplay();
         if (display) {
-            display->StopFFT();              // Dừng FFT của bài trước
-            display->ReleaseAudioBuffFFT();  // Giải phóng buffer FFT
-            ESP_LOGI(TAG, "[PATCH] Cleared FFT canvas before starting new song");
+            display->StopFFT();
+            display->ReleaseAudioBuffFFT();
         }
     }
-    fft_started_         = false;
+    fft_started_ = false;
     full_info_displayed_ = false;
     song_name_displayed_ = false;
-    // ============================================================
     
-    // Wait for the previous threads to fully terminate
+    // Wait for previous threads
     if (download_thread_.joinable()) {
         {
             std::lock_guard<std::mutex> lock(buffer_mutex_);
-            buffer_cv_.notify_all();  // Notify threads to exit
+            buffer_cv_.notify_all();
         }
         download_thread_.join();
     }
     if (play_thread_.joinable()) {
         {
             std::lock_guard<std::mutex> lock(buffer_mutex_);
-            buffer_cv_.notify_all();  // Notify threads to exit
+            buffer_cv_.notify_all();
         }
         play_thread_.join();
     }
     
-    // Clear the buffer
+    // Clear buffer
     ClearAudioBuffer();
     
-    // Configure thread stack size to avoid stack overflow
+    // Configure thread
     esp_pthread_cfg_t cfg = esp_pthread_get_default_config();
-    cfg.stack_size = 1024 * 3;  // 3KB stack size
-    cfg.prio = 5;           // Medium priority
-    cfg.thread_name = "audio_stream";
+    cfg.stack_size = 1024 * 3;
+    cfg.prio = 5;
+    cfg.thread_name = "zingmp3_stream";
     esp_pthread_set_cfg(&cfg);
     
-    // Start the download thread
+    // Start threads
     is_downloading_ = true;
     download_thread_ = std::thread(&Esp32Music::DownloadAudioStream, this, music_url);
     
-    // Start the playback thread (will wait for the buffer to have enough data)
     is_playing_ = true;
     play_thread_ = std::thread(&Esp32Music::PlayAudioStream, this);
     
-    ESP_LOGI(TAG, "Streaming threads started successfully");
-    
+    ESP_LOGI(TAG, "Streaming threads started");
     return true;
 }
 
-// Stop streaming playback
 bool Esp32Music::StopStreaming() {
-    if (!is_playing_ && !is_downloading_) {
-        ESP_LOGW(TAG, "No streaming in progress to stop");
-        return true;
-    }
-
-    ESP_LOGI(TAG, "Stopping music streaming - current state: downloading=%d, playing=%d", 
-            is_downloading_.load(), is_playing_.load());
-
-    // Reset the sample rate to the original value
-    ResetSampleRate();
-    
-    // Check if there is any streaming in progress
     if (!is_playing_ && !is_downloading_) {
         ESP_LOGW(TAG, "No streaming in progress");
         return true;
     }
     
-    // Stop download and playback flags
+    ESP_LOGI(TAG, "Stopping streaming");
+    
+    ResetSampleRate();
+    
     is_downloading_ = false;
     is_playing_ = false;
     
-    // Clear the song name display
-    auto& board = Board::GetInstance();
-    auto display = board.GetDisplay();
+    // Clear display
+    auto display = Board::GetInstance().GetDisplay();
     if (display) {
-        display->SetMusicInfo("");  // Clear the song name display
-        ESP_LOGI(TAG, "Cleared song name display");
+        display->SetMusicInfo("");
     }
     
-    // Notify all waiting threads
+    // Notify threads
     {
         std::lock_guard<std::mutex> lock(buffer_mutex_);
         buffer_cv_.notify_all();
     }
     
-    // Wait for threads to finish (avoid duplicate code, ensure StopStreaming waits for threads to fully stop)
+    // Wait for threads
     if (download_thread_.joinable()) {
         download_thread_.join();
-        ESP_LOGI(TAG, "Download thread joined in StopStreaming");
     }
-    
-    // Wait for the playback thread to finish, using a safer approach
     if (play_thread_.joinable()) {
-        // First, set the stop flag
-        is_playing_ = false;
-        
-        // Notify the condition variable to ensure the thread can exit
-        {
-            std::lock_guard<std::mutex> lock(buffer_mutex_);
-            buffer_cv_.notify_all();
-        }
-        
-        // Use a timeout mechanism to wait for the thread to finish, avoiding deadlocks
-        bool thread_finished = false;
-        int wait_count = 0;
-        const int max_wait = 100; // Maximum wait time of 1 second
-        
-        while (!thread_finished && wait_count < max_wait) {
-            vTaskDelay(pdMS_TO_TICKS(10));
-            wait_count++;
-            
-            // Check if the thread is still joinable
-            if (!play_thread_.joinable()) {
-                thread_finished = true;
-                break;
-            }
-        }
-        
-        if (play_thread_.joinable()) {
-            if (wait_count >= max_wait) {
-                ESP_LOGW(TAG, "Play thread join timeout, detaching thread");
-                play_thread_.detach();
-            } else {
-                play_thread_.join();
-                ESP_LOGI(TAG, "Play thread joined in StopStreaming");
-            }
-        }
+        play_thread_.join();
     }
     
-    // After threads have fully stopped, stop FFT display only in spectrum mode
+    // Stop FFT
     if (display && display_mode_ == DISPLAY_MODE_SPECTRUM) {
         display->StopFFT();
-        display->ReleaseAudioBuffFFT();   
-        final_pcm_data_fft = nullptr;     
-
-        ESP_LOGI(TAG, "Stopped FFT display and cleared FFT buffer in StopStreaming (spectrum mode)");
-    } else if (display) {
-        ESP_LOGI(TAG, "Not in spectrum mode, skipping FFT stop in StopStreaming");
+        display->ReleaseAudioBuffFFT();
+        final_pcm_data_fft = nullptr;
     }
-        
-    // Reset FFT flag for next use
+    
     fft_started_ = false;
+    current_song_id_.clear();
+    current_song_info_ = SongInfo();
     
-    ESP_LOGI(TAG, "Music streaming stop signal sent");
-    
-    title_name_.clear();
-    artist_name_.clear();
-    current_song_name_.clear();
-
+    ESP_LOGI(TAG, "Streaming stopped");
     return true;
 }
 
-// Stream audio data
+// Reuse the same streaming implementation from esp32_music.cc
 void Esp32Music::DownloadAudioStream(const std::string& music_url) {
-    ESP_LOGD(TAG, "Starting audio stream download from: %s", music_url.c_str());
+    ESP_LOGI(TAG, "Starting audio download from: %s", music_url.c_str());
     
-    // Validate URL
     if (music_url.empty() || music_url.find("http") != 0) {
-        ESP_LOGE(TAG, "Invalid URL format: %s", music_url.c_str());
+        ESP_LOGE(TAG, "Invalid URL: %s", music_url.c_str());
         is_downloading_ = false;
         return;
     }
@@ -654,34 +556,29 @@ void Esp32Music::DownloadAudioStream(const std::string& music_url) {
     auto network = Board::GetInstance().GetNetwork();
     auto http = network->CreateHttp(0);
     
-    // Set basic request headers
-    http->SetHeader("User-Agent", "ESP32-Music-Player/1.0");
+    http->SetHeader("User-Agent", "ESP32-ZingMP3-Player/1.0");
     http->SetHeader("Accept", "*/*");
-    http->SetHeader("Range", "bytes=0-");  // Support range requests
-    http->SetHeader("Connection", "keep-alive");  // Giữ kết nối ổn định
-    http->SetHeader("Cache-Control", "no-cache"); // Tránh cache cũ
-    
-    // Add ESP32 authentication headers
-    add_auth_headers(http.get());
+    http->SetHeader("Range", "bytes=0-");
+    http->SetHeader("Connection", "keep-alive");
+    http->SetHeader("Cache-Control", "no-cache");
     
     if (!http->Open("GET", music_url)) {
-        ESP_LOGE(TAG, "Failed to connect to music stream URL");
+        ESP_LOGE(TAG, "Failed to connect to stream URL");
         is_downloading_ = false;
         return;
     }
     
     int status_code = http->GetStatusCode();
-    if (status_code != 200 && status_code != 206) {  // 206 for partial content
-        ESP_LOGE(TAG, "HTTP GET failed with status code: %d", status_code);
+    if (status_code != 200 && status_code != 206) {
+        ESP_LOGE(TAG, "HTTP failed with status: %d", status_code);
         http->Close();
         is_downloading_ = false;
         return;
     }
     
-    ESP_LOGI(TAG, "Started downloading audio stream, status: %d", status_code);
+    ESP_LOGI(TAG, "Download started, status: %d", status_code);
     
-    // Read audio data in chunks
-    const size_t chunk_size = 4096;  // 4KB per chunk
+    const size_t chunk_size = 4096;
     char* buffer = new char[chunk_size];
     size_t total_downloaded = 0;
     size_t total_print_bytes = 0;
@@ -689,56 +586,32 @@ void Esp32Music::DownloadAudioStream(const std::string& music_url) {
     while (is_downloading_ && is_playing_) {
         int bytes_read = http->Read(buffer, chunk_size);
         if (bytes_read < 0) {
-            ESP_LOGE(TAG, "Failed to read audio data: error code %d", bytes_read);
+            ESP_LOGE(TAG, "Read error: %d", bytes_read);
             break;
         }
         if (bytes_read == 0) {
-            ESP_LOGI(TAG, "Audio stream download completed, total: %d bytes", total_downloaded);
+            ESP_LOGI(TAG, "Download complete: %d bytes", total_downloaded);
             break;
         }
         
-        // Log chunk information
-        // ESP_LOGI(TAG, "Downloaded chunk: %d bytes at offset %d", bytes_read, total_downloaded);
-        
-        // Safely log the first 16 bytes of the chunk in hexadecimal
-        if (bytes_read >= 16) {
-            // ESP_LOGI(TAG, "Data: %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X ...", 
-            //         (unsigned char)buffer[0], (unsigned char)buffer[1], (unsigned char)buffer[2], (unsigned char)buffer[3],
-            //         (unsigned char)buffer[4], (unsigned char)buffer[5], (unsigned char)buffer[6], (unsigned char)buffer[7],
-            //         (unsigned char)buffer[8], (unsigned char)buffer[9], (unsigned char)buffer[10], (unsigned char)buffer[11],
-            //         (unsigned char)buffer[12], (unsigned char)buffer[13], (unsigned char)buffer[14], (unsigned char)buffer[15]);
-        } else {
-            ESP_LOGI(TAG, "Data chunk too small: %d bytes", bytes_read);
-        }
-        
-        // Attempt to detect file format (check file header)
+        // Detect file format on first chunk
         if (total_downloaded == 0 && bytes_read >= 4) {
             if (memcmp(buffer, "ID3", 3) == 0) {
-                ESP_LOGI(TAG, "Detected MP3 file with ID3 tag");
+                ESP_LOGI(TAG, "Detected MP3 with ID3 tag");
             } else if (buffer[0] == 0xFF && (buffer[1] & 0xE0) == 0xE0) {
-                ESP_LOGI(TAG, "Detected MP3 file header");
-            } else if (memcmp(buffer, "RIFF", 4) == 0) {
-                ESP_LOGI(TAG, "Detected WAV file");
-            } else if (memcmp(buffer, "fLaC", 4) == 0) {
-                ESP_LOGI(TAG, "Detected FLAC file");
-            } else if (memcmp(buffer, "OggS", 4) == 0) {
-                ESP_LOGI(TAG, "Detected OGG file");
-            } else {
-                ESP_LOGI(TAG, "Unknown audio format, first 4 bytes: %02X %02X %02X %02X", 
-                        (unsigned char)buffer[0], (unsigned char)buffer[1], 
-                        (unsigned char)buffer[2], (unsigned char)buffer[3]);
+                ESP_LOGI(TAG, "Detected MP3 header");
             }
         }
         
-        // Create audio data chunk
+        // Allocate chunk
         uint8_t* chunk_data = (uint8_t*)heap_caps_malloc(bytes_read, MALLOC_CAP_SPIRAM);
         if (!chunk_data) {
-            ESP_LOGE(TAG, "Failed to allocate memory for audio chunk");
+            ESP_LOGE(TAG, "Failed to allocate chunk memory");
             break;
         }
         memcpy(chunk_data, buffer, bytes_read);
         
-        // Wait for buffer space
+        // Add to buffer
         {
             std::unique_lock<std::mutex> lock(buffer_mutex_);
             buffer_cv_.wait(lock, [this] { return buffer_size_ < MAX_BUFFER_SIZE || !is_downloading_; });
@@ -749,12 +622,11 @@ void Esp32Music::DownloadAudioStream(const std::string& music_url) {
                 total_downloaded += bytes_read;
                 total_print_bytes += bytes_read;
                 
-                // Notify playback thread of new data
                 buffer_cv_.notify_one();
                 
-                if (total_print_bytes >= (128 * 1024)) {  // Log progress every 128KB
+                if (total_print_bytes >= (128 * 1024)) {
                     total_print_bytes = 0;
-                    ESP_LOGI(TAG, "Downloaded %d bytes, buffer size: %d", total_downloaded, buffer_size_);
+                    ESP_LOGI(TAG, "Downloaded %d bytes, buffer: %d", total_downloaded, buffer_size_);
                 }
             } else {
                 heap_caps_free(chunk_data);
@@ -762,54 +634,42 @@ void Esp32Music::DownloadAudioStream(const std::string& music_url) {
             }
         }
     }
+    
     delete[] buffer;
-    
     http->Close();
-
-    if (is_downloading_) {
-        ESP_LOGI(TAG, "Audio stream download finished successfully, total downloaded: %d bytes", total_downloaded);
-    } else {
-        ESP_LOGI(TAG, "Audio stream download stopped by user, total downloaded: %d bytes", total_downloaded);
-    }
     
+    ESP_LOGI(TAG, "Download thread finished, total: %d bytes", total_downloaded);
     is_downloading_ = false;
     
-    // Notify playback thread that download is complete
     {
         std::lock_guard<std::mutex> lock(buffer_mutex_);
         buffer_cv_.notify_all();
     }
-    
-    ESP_LOGI(TAG, "Audio stream download thread finished");
 }
 
-// Stream audio data
 void Esp32Music::PlayAudioStream() {
-    ESP_LOGI(TAG, "Starting audio stream playback");
+    ESP_LOGI(TAG, "Starting playback thread");
     
-    // Initialize time tracking variables
     current_play_time_ms_ = 0;
     last_frame_time_ms_ = 0;
     total_frames_decoded_ = 0;
     
     auto codec = Board::GetInstance().GetAudioCodec();
     if (!codec) {
-        ESP_LOGE(TAG, "Audio codec not available or not enabled");
+        ESP_LOGE(TAG, "Audio codec not available");
         is_playing_ = false;
         return;
     }
-
-    // Ensure audio output is enabled
+    
     if (!codec->output_enabled()) {
         codec->EnableOutput(true);
     }
     
     if (!mp3_decoder_initialized_) {
-        ESP_LOGI(TAG, "MP3 decoder not initialized, initializing now");
         InitializeMp3Decoder();
     }
     
-    // Wait for the buffer to have enough data to start playback
+    // Wait for buffer
     {
         std::unique_lock<std::mutex> lock(buffer_mutex_);
         buffer_cv_.wait(lock, [this] { 
@@ -817,29 +677,25 @@ void Esp32Music::PlayAudioStream() {
         });
     }
     
-    ESP_LOGI(TAG, "Starting playback with buffer size: %d", buffer_size_);
+    ESP_LOGI(TAG, "Starting playback with buffer: %d", buffer_size_);
     
     size_t total_played_bytes = 0;
-    size_t total_print_bytes = 0;
     uint8_t* mp3_input_buffer = nullptr;
     int bytes_left = 0;
     uint8_t* read_ptr = nullptr;
     
     constexpr int INPUT_BUF = 8192;
-    // Allocate MP3 input buffer
     mp3_input_buffer = (uint8_t*)heap_caps_malloc(INPUT_BUF, MALLOC_CAP_SPIRAM);
     if (!mp3_input_buffer) {
-        ESP_LOGE(TAG, "Failed to allocate MP3 input buffer");
+        ESP_LOGE(TAG, "Failed to allocate MP3 buffer");
         is_playing_ = false;
         return;
     }
     
-    // Flag to indicate if ID3 tags have been processed
     bool id3_processed = false;
-
     auto& board = Board::GetInstance();
     auto display = board.GetDisplay();
-    int16_t* pcm_buffer = new int16_t[2304];  // Max PCM samples per MP3 frame
+    int16_t* pcm_buffer = new int16_t[2304];
     if (!pcm_buffer) {
         ESP_LOGE(TAG, "Failed to allocate PCM buffer");
         heap_caps_free(mp3_input_buffer);
@@ -848,70 +704,54 @@ void Esp32Music::PlayAudioStream() {
     }
     
     while (is_playing_) {
-        // Check device state, only play music in idle state
+        // Check device state
         auto& app = Application::GetInstance();
         DeviceState current_state = app.GetDeviceState();
         
-        // State transition: Speaking -> Listening -> Idle -> Play music
         if (current_state == kDeviceStateListening || current_state == kDeviceStateSpeaking) {
-            if (current_state == kDeviceStateSpeaking) {
-                ESP_LOGI(TAG, "Device is in speaking state, switching to listening state for music playback");
-            }
-            if (current_state == kDeviceStateListening) {
-                ESP_LOGI(TAG, "Device is in listening state, switching to idle state for music playback");
-            }
-            // Switch state
-            app.ToggleChatState(); // Transition to idle state
+            app.ToggleChatState();
             vTaskDelay(pdMS_TO_TICKS(300));
             continue;
-        } else if (current_state != kDeviceStateIdle) { // If not idle, block music playback
-            ESP_LOGD(TAG, "Device state is %d, pausing music playback", current_state);
+        } else if (current_state != kDeviceStateIdle) {
             vTaskDelay(pdMS_TO_TICKS(50));
             continue;
         }
         
-        // Start FFT only once per streaming session
+        // Start FFT once
         if (!fft_started_) {
             if (display && display_mode_ == DISPLAY_MODE_SPECTRUM) {
                 vTaskDelay(pdMS_TO_TICKS(150));
                 display->StartFFT();
-                ESP_LOGI(TAG, "StartFFT() triggered ONE TIME");
-
-                // Refresh song info AFTER canvas created
-                if (!current_song_name_.empty()) {
+                ESP_LOGI(TAG, "FFT started");
+                
+                // Refresh song info
+                if (!current_song_info_.title.empty()) {
                     char buf[256];
                     snprintf(buf, sizeof(buf),
-                             "ONLINE 《%s》\n%s • Đang phát...",
-                             title_name_.empty() ? current_song_name_.c_str() : title_name_.c_str(),
-                             artist_name_.empty() ? "Unknown Artist" : artist_name_.c_str());
-
+                             "ZINGMP3 《%s》\n%s • Đang phát...",
+                             current_song_info_.title.c_str(),
+                             current_song_info_.artist.c_str());
                     display->SetMusicInfo(buf);
-                    ESP_LOGI(TAG, "REFRESH SONG INFO AFTER CANVAS: %s", buf);
                 }
             }
             fft_started_ = true;
         }
-
-
-        // Show song title only once
-        if (!song_name_displayed_ && !current_song_name_.empty()) {
+        
+        if (!song_name_displayed_ && !current_song_info_.title.empty()) {
             song_name_displayed_ = true;
         }
         
-        // If more MP3 data is needed, read from the buffer
-        if (bytes_left < (INPUT_BUF / 2)) {  // Maintain at least 8KB of data for decoding
+        // Read more data if needed
+        if (bytes_left < (INPUT_BUF / 2)) {
             AudioChunk chunk;
             
-            // Retrieve audio data from the buffer
             {
                 std::unique_lock<std::mutex> lock(buffer_mutex_);
                 if (audio_buffer_.empty()) {
                     if (!is_downloading_) {
-                        // Download complete and buffer empty, playback ends
-                        ESP_LOGI(TAG, "Playback finished, total played: %d bytes", total_played_bytes);
+                        ESP_LOGI(TAG, "Playback finished");
                         break;
                     }
-                    // Wait for new data
                     buffer_cv_.wait(lock, [this] { return !audio_buffer_.empty() || !is_downloading_; });
                     if (audio_buffer_.empty()) {
                         continue;
@@ -922,700 +762,294 @@ void Esp32Music::PlayAudioStream() {
                 audio_buffer_.pop();
                 buffer_size_ -= chunk.size;
                 total_played_bytes += chunk.size;
-                total_print_bytes += chunk.size;
                 
-                // Notify download thread that buffer has space
                 buffer_cv_.notify_one();
             }
             
-            // Add new data to the MP3 input buffer
             if (chunk.data && chunk.size > 0) {
-                // Move remaining data to the beginning of the buffer
                 if (bytes_left > 0 && read_ptr != mp3_input_buffer) {
                     memmove(mp3_input_buffer, read_ptr, bytes_left);
                 }
                 
-                // Check buffer space
                 size_t space_available = INPUT_BUF - bytes_left;
                 size_t copy_size = std::min(chunk.size, space_available);
                 
-                // Copy new data
                 memcpy(mp3_input_buffer + bytes_left, chunk.data, copy_size);
                 bytes_left += copy_size;
                 read_ptr = mp3_input_buffer;
                 memset(mp3_input_buffer + bytes_left, 0, INPUT_BUF - bytes_left);
                 
-                // Check and skip ID3 tags (allow multi-chunk ID3 skipping)
-                if (!id3_processed && bytes_left >= 10)
-                {
+                // Skip ID3 tag
+                if (!id3_processed && bytes_left >= 10) {
                     size_t id3_skip = SkipId3Tag(read_ptr, bytes_left);
                     if (id3_skip > 0) {
-
-                        // skip ID3 part in current buffer
                         read_ptr += id3_skip;
                         bytes_left -= id3_skip;
-
-                        ESP_LOGI(TAG, "Skipped ID3 tag: %u bytes", (unsigned int)id3_skip);
-
-                        // If ID3 header is larger than buffer, wait for next chunk
+                        ESP_LOGI(TAG, "Skipped ID3: %u bytes", (unsigned int)id3_skip);
+                        
                         if (bytes_left < 256) {
-                            ESP_LOGW(TAG, "Remaining buffer too small after ID3 skip, waiting for next chunk");
                             bytes_left = 0;
                             heap_caps_free(chunk.data);
-                            continue;   // pump next incoming data
+                            continue;
                         }
                     }
-
-                    // Mark as processed ONLY when buffer seems OK (≥ sync possible)
+                    
                     if (bytes_left >= 256) {
                         id3_processed = true;
                     }
                 }
-                                
-                // Free chunk memory
+                
                 heap_caps_free(chunk.data);
             }
         }
         
-        // Attempt to find MP3 frame sync
+        // Find MP3 sync
         int sync_offset = MP3FindSyncWord(read_ptr, bytes_left);
         if (sync_offset < 0) {
-            ESP_LOGW(TAG, "No MP3 sync word found, skipping %d bytes", bytes_left);
             vTaskDelay(pdMS_TO_TICKS(2));
             bytes_left = 0;
             continue;
         }
         
-        if (bytes_left < 128) {            
+        if (bytes_left < 128) {
             vTaskDelay(pdMS_TO_TICKS(2));
             continue;
         }
-
-        // Skip to sync position
+        
         if (sync_offset > 0) {
-            ESP_LOGW(TAG, "MP3 sync word found at offset %d, skipping bytes", sync_offset);
             read_ptr += sync_offset;
             bytes_left -= sync_offset;
         }
         
         // Decode MP3 frame
-        int bytes_left_before = bytes_left;
         int decode_result = MP3Decode(mp3_decoder_, &read_ptr, &bytes_left, pcm_buffer, 0);
-        
-        if (decode_result == 0) {
-            // Decode successful, get frame info
-            MP3GetLastFrameInfo(mp3_decoder_, &mp3_frame_info_);
-            
-            // ---- SONG INFO DISPLAY ----
-            if (!full_info_displayed_) { 
-                if (display) {
-
-                    char buf[256];
-
-                    int br = (mp3_frame_info_.bitrate > 0)
-                                ? mp3_frame_info_.bitrate / 1000
-                                : 0;
-
-                    int hz = (mp3_frame_info_.samprate > 0)
-                                ? mp3_frame_info_.samprate
-                                : 44100;
-
-                    const char* ch = (mp3_frame_info_.nChans == 2) ? "Stereo" : "Mono";
-
-                    snprintf(buf, sizeof(buf),
-                            "ONLINE 《%s》\n%s • %d kbps | %d Hz | %s",
-                            title_name_.empty() ? current_song_name_.c_str() : title_name_.c_str(),
-                            artist_name_.empty() ? "Unknown Artist" : artist_name_.c_str(),
-                            br, hz, ch);
-
-                    display->SetMusicInfo(buf);
-                }
-
-                full_info_displayed_ = true;
-            }
-
-            total_frames_decoded_++;
-            
-            // Basic frame info validity check to prevent division by zero
-            if (mp3_frame_info_.samprate == 0 || mp3_frame_info_.nChans == 0) {
-                ESP_LOGW(TAG, "Invalid frame info: rate=%d, channels=%d, skipping", 
-                        mp3_frame_info_.samprate, mp3_frame_info_.nChans);
-                continue;
-            }
-            
-            // Calculate the duration of the current frame (in milliseconds)
-            int frame_duration_ms = (mp3_frame_info_.outputSamps * 1000) / 
-                                  (mp3_frame_info_.samprate * mp3_frame_info_.nChans);
-            
-            // Update current playback time
-            current_play_time_ms_ += frame_duration_ms;
-            
-            ESP_LOGD(TAG, "Frame %d: time=%lldms, duration=%dms, rate=%d, ch=%d", 
-                    total_frames_decoded_, current_play_time_ms_, frame_duration_ms,
-                    mp3_frame_info_.samprate, mp3_frame_info_.nChans);
-            
-            // Update lyric display
-            int buffer_latency_ms = 600; // Adjusted based on testing
-            UpdateLyricDisplay(current_play_time_ms_ + buffer_latency_ms);
-            
-            // Send PCM data to the Application's audio decoding queue
-            if (mp3_frame_info_.outputSamps > 0) {
-                int16_t* final_pcm_data = pcm_buffer;
-                int final_sample_count = mp3_frame_info_.outputSamps;
-                std::vector<int16_t> mono_buffer;
-                
-                // If stereo, convert to mono
-                if (mp3_frame_info_.nChans == 2) {
-                    // Convert stereo to mono: mix left and right channels
-                    int stereo_samples = mp3_frame_info_.outputSamps;  // Total samples including both channels
-                    int mono_samples = stereo_samples / 2;  // Actual mono sample count
-                    
-                    mono_buffer.resize(mono_samples);
-                    
-                    for (int i = 0; i < mono_samples; ++i) {
-                        // Mix left and right channels (L + R) / 2
-                        int left = pcm_buffer[i * 2];      // Left channel
-                        int right = pcm_buffer[i * 2 + 1]; // Right channel
-                        mono_buffer[i] = (int16_t)((left + right) / 2);
-                    }
-                    
-                    final_pcm_data = mono_buffer.data();
-                    final_sample_count = mono_samples;
-
-                    ESP_LOGD(TAG, "Converted stereo to mono: %d -> %d samples", 
-                            stereo_samples, mono_samples);
-                } else if (mp3_frame_info_.nChans == 1) {
-                    // Already mono, no conversion needed
-                    ESP_LOGD(TAG, "Already mono audio: %d samples", final_sample_count);
-                } else {
-                    ESP_LOGW(TAG, "Unsupported channel count: %d, treating as mono", 
-                            mp3_frame_info_.nChans);
-                }
-                
-                // Create AudioStreamPacket
-                AudioStreamPacket packet;
-                packet.sample_rate = mp3_frame_info_.samprate;
-                packet.frame_duration = 60;  // Use Application's default frame duration
-                packet.timestamp = 0;
-                
-                // Convert int16_t PCM data to uint8_t byte array
-                size_t pcm_size_bytes = final_sample_count * sizeof(int16_t);
-                packet.payload.resize(pcm_size_bytes);
-                memcpy(packet.payload.data(), final_pcm_data, pcm_size_bytes);
-
-                if (display) {
-                    if (display_mode_ == DISPLAY_MODE_SPECTRUM) {
-                        // Create or update FFT audio data buffer
-                        final_pcm_data_fft = display->MakeAudioBuffFFT(pcm_size_bytes);
-
-                        // Push PCM data to FFT buffer
-                        display->FeedAudioDataFFT(final_pcm_data, pcm_size_bytes);
-                    }
-                }
-
-                ESP_LOGD(TAG, "Sending %d PCM samples (%d bytes, rate=%d, channels=%d->1) to Application", 
-                        final_sample_count, pcm_size_bytes, mp3_frame_info_.samprate, mp3_frame_info_.nChans);
-                
-                // Send to Application's audio decoding queue
-                app.AddAudioData(std::move(packet));
-                
-                // Log playback progress
-                if (total_print_bytes >= (128 * 1024)) {
-                    total_print_bytes = 0;
-                    ESP_LOGI(TAG, "Played %d bytes, buffer size: %d", total_played_bytes, buffer_size_);
-                }
-            }
-            
-        } else {
-            // Decode failed
-            ESP_LOGW(TAG, "MP3 decode failed with error: %d, bytes_left_before: %d, bytes_left: %d", decode_result, bytes_left_before, bytes_left);
-            if (bytes_left > 0 && bytes_left < bytes_left_before) {
-                // Skip one byte and try again
-                read_ptr++;
-                bytes_left--;
-            } else {
-                bytes_left = 0;
-            }
-            vTaskDelay(pdMS_TO_TICKS(10));
+        if (decode_result != 0) {
+            vTaskDelay(pdMS_TO_TICKS(2));
             continue;
         }
-    }
-    
-    // Free PCM buffer
-    delete[] pcm_buffer;
-
-    if (is_playing_) {
-        ESP_LOGI(TAG, "Audio stream playback finished successfully, total played: %d bytes", total_played_bytes);
-        ClearAudioBuffer();
-        // Reset the sample rate to the original value
-        ResetSampleRate();
-    } else {
-        ESP_LOGI(TAG, "Audio stream playback stopped by user, total played: %d bytes", total_played_bytes);
-    }
-
-    // Cleanup
-        if (mp3_input_buffer) {
-        heap_caps_free(mp3_input_buffer);
-    }
-    
-    ESP_LOGI(TAG, "Audio stream playback finished, total played: %d bytes", total_played_bytes);
-    ESP_LOGI(TAG, "Performing basic cleanup from play thread");
-    
-    // Stop playback flag
-    is_playing_ = false;
-
-    // Chỉ xử lý FFT khi đang ở chế độ SPECTRUM
-    if (display) {
-        if (display_mode_ == DISPLAY_MODE_SPECTRUM) {
-            // 1 Xoá text info cả trên canvas + chat label, nhờ SetMusicInfo mới chỉnh ở trên
-            display->SetMusicInfo("");
-
-            // 2 Dừng FFT + xoá UI nhạc + free buffer
-            display->StopFFT();
-            display->ReleaseAudioBuffFFT();
-
-            ESP_LOGI(TAG, "Stopped FFT display and cleared music UI from play thread (spectrum mode)");
-        } else {
-            ESP_LOGI(TAG, "Not in spectrum mode, skipping FFT stop");
+        
+        MP3GetLastFrameInfo(mp3_decoder_, &mp3_frame_info_);
+        
+        // Update playback time
+        if (mp3_frame_info_.samprate > 0) {
+            int frame_duration_ms = (mp3_frame_info_.outputSamps / mp3_frame_info_.nChans * 1000) / mp3_frame_info_.samprate;
+            current_play_time_ms_ += frame_duration_ms;
+            total_frames_decoded_++;
         }
+        
+        // Play audio
+        size_t samples_to_write = mp3_frame_info_.outputSamps;
+        final_pcm_data_fft = pcm_buffer;
+        
+        codec->Write((uint8_t*)pcm_buffer, samples_to_write * sizeof(int16_t));
     }
-    final_pcm_data_fft = nullptr;
-    ClearAudioBuffer();
-    buffer_size_ = 0;
-    CleanupMp3Decoder();
-
-    // Bật lại output để radio dùng
-    auto codec2 = Board::GetInstance().GetAudioCodec();
-    if (codec2) codec2->EnableOutput(true);
-
-    ESP_LOGI(TAG, "[PATCH] Full cleanup done after PlayAudioStream");
+    
+    delete[] pcm_buffer;
+    heap_caps_free(mp3_input_buffer);
+    
+    ESP_LOGI(TAG, "Playback thread finished");
+    is_playing_ = false;
 }
 
-// Clear audio buffer
 void Esp32Music::ClearAudioBuffer() {
     std::lock_guard<std::mutex> lock(buffer_mutex_);
-    
     while (!audio_buffer_.empty()) {
-        AudioChunk chunk = audio_buffer_.front();
-        audio_buffer_.pop();
+        auto chunk = audio_buffer_.front();
         if (chunk.data) {
             heap_caps_free(chunk.data);
         }
+        audio_buffer_.pop();
     }
-    
     buffer_size_ = 0;
-    ESP_LOGI(TAG, "Audio buffer cleared");
 }
 
-// Initialize MP3 decoder
 bool Esp32Music::InitializeMp3Decoder() {
+    if (mp3_decoder_initialized_) {
+        return true;
+    }
+    
     mp3_decoder_ = MP3InitDecoder();
-    if (mp3_decoder_ == nullptr) {
+    if (!mp3_decoder_) {
         ESP_LOGE(TAG, "Failed to initialize MP3 decoder");
-        mp3_decoder_initialized_ = false;
         return false;
     }
     
     mp3_decoder_initialized_ = true;
-    ESP_LOGI(TAG, "MP3 decoder initialized successfully");
+    ESP_LOGI(TAG, "MP3 decoder initialized");
     return true;
 }
 
-// 清理MP3解码器
 void Esp32Music::CleanupMp3Decoder() {
-    if (mp3_decoder_ != nullptr) {
+    if (mp3_decoder_initialized_ && mp3_decoder_) {
         MP3FreeDecoder(mp3_decoder_);
         mp3_decoder_ = nullptr;
+        mp3_decoder_initialized_ = false;
+        ESP_LOGI(TAG, "MP3 decoder cleaned up");
     }
-    mp3_decoder_initialized_ = false;
-    ESP_LOGI(TAG, "MP3 decoder cleaned up");
 }
 
-// Reset the sample rate to the original value
 void Esp32Music::ResetSampleRate() {
-    auto& board = Board::GetInstance();
-    auto codec = board.GetAudioCodec();
-    if (codec && codec->original_output_sample_rate() > 0 && 
-        codec->output_sample_rate() != codec->original_output_sample_rate()) {
-            ESP_LOGI(TAG, "Resetting sample rate: %d Hz -> %d Hz", 
-                codec->output_sample_rate(), codec->original_output_sample_rate());
-        if (codec->SetOutputSampleRate(-1)) {  // -1: Reset to the original value
-            ESP_LOGI(TAG, "Sample rate reset to original value: %d Hz", codec->output_sample_rate());
-        } else {
-            ESP_LOGW(TAG, "Failed to reset sample rate to original value");
-        }
+    auto codec = Board::GetInstance().GetAudioCodec();
+    if (codec) {
+        // Reset to default sample rate if needed
+        ESP_LOGI(TAG, "Sample rate reset");
     }
 }
 
-// Skip the ID3 tag at the beginning of the MP3 file
 size_t Esp32Music::SkipId3Tag(uint8_t* data, size_t size) {
-    if (!data || size < 10) {
-        return 0;
+    if (size < 10) return 0;
+    
+    if (data[0] == 'I' && data[1] == 'D' && data[2] == '3') {
+        size_t tag_size = ((data[6] & 0x7F) << 21) |
+                         ((data[7] & 0x7F) << 14) |
+                         ((data[8] & 0x7F) << 7) |
+                         (data[9] & 0x7F);
+        return tag_size + 10;
     }
     
-    // Check for ID3v2 tag header "ID3"
-    if (memcmp(data, "ID3", 3) != 0) {
-        return 0;
-    }
-    
-    // Calculate tag size (synchsafe integer format)
-    uint32_t tag_size = ((uint32_t)(data[6] & 0x7F) << 21) |
-                        ((uint32_t)(data[7] & 0x7F) << 14) |
-                        ((uint32_t)(data[8] & 0x7F) << 7)  |
-                        ((uint32_t)(data[9] & 0x7F));
-    
-    // ID3v2 header (10 bytes) + tag content
-    size_t total_skip = 10 + tag_size;
-    
-    // Ensure it does not exceed available data size
-    if (total_skip > size) {
-        total_skip = size;
-    }
-    
-    ESP_LOGI(TAG, "Found ID3v2 tag, skipping %u bytes", (unsigned int)total_skip);
-    return total_skip;
+    return 0;
 }
 
-// Download lyrics
-bool Esp32Music::DownloadLyrics(const std::string& lyric_url) {
-    ESP_LOGI(TAG, "Downloading lyrics from: %s", lyric_url.c_str());
+bool Esp32Music::GetLyrics(const std::string& song_id) {
+    ESP_LOGI(TAG, "Getting lyrics for song ID: %s", song_id.c_str());
     
-    // Check if the URL is empty
-    if (lyric_url.empty()) {
-        ESP_LOGE(TAG, "Lyric URL is empty!");
+    std::string lyric_url = zingmp3_server_url_ + "/api/lyric?id=" + song_id;
+    
+    auto network = Board::GetInstance().GetNetwork();
+    auto http = network->CreateHttp(0);
+    
+    http->SetHeader("User-Agent", "ESP32-ZingMP3-Player/1.0");
+    http->SetHeader("Accept", "application/json");
+    
+    if (!http->Open("GET", lyric_url)) {
+        ESP_LOGE(TAG, "Failed to connect to lyric API");
         return false;
     }
     
-    // Add retry logic
-    const int max_retries = 3;
-    int retry_count = 0;
-    bool success = false;
-    std::string lyric_content;
-    std::string current_url = lyric_url;
-    int redirect_count = 0;
-    const int max_redirects = 5;  // Allow up to 5 redirects
-    
-    while (retry_count < max_retries && !success && redirect_count < max_redirects) {
-        if (retry_count > 0) {
-            ESP_LOGI(TAG, "Retrying lyric download (attempt %d of %d)", retry_count + 1, max_retries);
-            // Pause before retrying
-            std::this_thread::sleep_for(std::chrono::milliseconds(500));
-        }
-        
-        // Use the HTTP client provided by the Board
-        auto network = Board::GetInstance().GetNetwork();
-        auto http = network->CreateHttp(0);
-        if (!http) {
-            ESP_LOGE(TAG, "Failed to create HTTP client for lyric download");
-            retry_count++;
-            continue;
-        }
-        
-        // Set basic request headers
-        http->SetHeader("User-Agent", "ESP32-Music-Player/1.0");
-        http->SetHeader("Accept", "text/plain");
-        
-        // Add ESP32 authentication headers
-        add_auth_headers(http.get());
-        
-        // Open GET connection
-        ESP_LOGI(TAG, "Xiaozhi Open Source Music Firmware QQ Group: 826072986");
-        if (!http->Open("GET", current_url)) {
-            ESP_LOGE(TAG, "Failed to open HTTP connection for lyrics");
-            retry_count++;
-            continue;
-        }
-        
-        // Check HTTP status code
-        int status_code = http->GetStatusCode();
-        ESP_LOGI(TAG, "Lyric download HTTP status code: %d", status_code);
-        
-        // Handle redirects - Since the Http class does not have a GetHeader method, we can only report the redirect
-        if (status_code == 301 || status_code == 302 || status_code == 303 || status_code == 307 || status_code == 308) {
-            // 由于无法获取Location头，只能报告重定向但无法继续
-            ESP_LOGW(TAG, "Received redirect status %d but cannot follow redirect (no GetHeader method)", status_code);
-            http->Close();
-            retry_count++;
-            continue;
-        }
-        
-        // Non-200 status codes are treated as errors
-        if (status_code < 200 || status_code >= 300) {
-            ESP_LOGE(TAG, "HTTP GET failed with status code: %d", status_code);
-            http->Close();
-            retry_count++;
-            continue;
-        }
-        
-        // Read the response
-        lyric_content.clear();
-        char buffer[1024];
-        int bytes_read;
-        bool read_error = false;
-        int total_read = 0;
-        
-        // Since we cannot retrieve the Content-Length and Content-Type headers, we do not know the expected size and content type
-        ESP_LOGD(TAG, "Starting to read lyric content");
-        
-        while (true) {
-            bytes_read = http->Read(buffer, sizeof(buffer) - 1);
-            // ESP_LOGD(TAG, "Lyric HTTP read returned %d bytes", bytes_read); // Commented out to reduce log output
-            
-            if (bytes_read > 0) {
-                buffer[bytes_read] = '\0';
-                lyric_content += buffer;
-                total_read += bytes_read;
-                
-                // Periodically log download progress
-                if (total_read % 4096 == 0) {
-                    ESP_LOGD(TAG, "Downloaded %d bytes so far", total_read);
-                }
-            } else if (bytes_read == 0) {
-                // Normal end, no more data
-                ESP_LOGD(TAG, "Lyric download completed, total bytes: %d", total_read);
-                success = true;
-                break;
-            } else {
-                // bytes_read < 0, possible known issue with ESP-IDF
-                if (!lyric_content.empty()) {
-                    ESP_LOGW(TAG, "HTTP read returned %d, but we have data (%d bytes), continuing", bytes_read, lyric_content.length());
-                    success = true;
-                    break;
-                } else {
-                    ESP_LOGE(TAG, "Failed to read lyric data: error code %d", bytes_read);
-                    read_error = true;
-                    break;
-                }
-            }
-        }
-        
+    int status_code = http->GetStatusCode();
+    if (status_code != 200) {
+        ESP_LOGE(TAG, "Lyric API failed with status: %d", status_code);
         http->Close();
-        
-        if (read_error) {
-            retry_count++;
-            continue;
-        }
-        
-        // If data was successfully read, exit the retry loop
-        if (success) {
-            break;
-        }
-    }
-    
-    // Check if maximum retries were exceeded
-    if (retry_count >= max_retries) {
-        ESP_LOGE(TAG, "Failed to download lyrics after %d attempts", max_retries);
         return false;
     }
     
-    // Log the first few bytes of the data for debugging
-    if (!lyric_content.empty()) {
-        size_t preview_size = std::min(lyric_content.size(), size_t(50));
-        std::string preview = lyric_content.substr(0, preview_size);
-        ESP_LOGD(TAG, "Lyric content preview (%d bytes): %s", lyric_content.length(), preview.c_str());
-    } else {
-        ESP_LOGE(TAG, "Failed to download lyrics or lyrics are empty");
-        return false;
-    }
+    std::string response = http->ReadAll();
+    http->Close();
     
-    ESP_LOGI(TAG, "Lyrics downloaded successfully, size: %d bytes", lyric_content.length());
-    return ParseLyrics(lyric_content);
+    return ParseZingMp3Lyrics(response);
 }
 
-// Parse lyrics
-bool Esp32Music::ParseLyrics(const std::string& lyric_content) {
-    ESP_LOGI(TAG, "Parsing lyrics content");
+bool Esp32Music::ParseZingMp3Lyrics(const std::string& lyric_json) {
+    cJSON* json = cJSON_Parse(lyric_json.c_str());
+    if (!json) {
+        ESP_LOGE(TAG, "Failed to parse lyric JSON");
+        return false;
+    }
     
-    // Use a lock to protect access to the lyrics_ array
-    std::lock_guard<std::mutex> lock(lyrics_mutex_);
-    
-    lyrics_.clear();
-    
-    // Split the lyric content by lines
-    std::istringstream stream(lyric_content);
-    std::string line;
-    
-    while (std::getline(stream, line)) {
-        // Remove carriage return at the end of the line
-        if (!line.empty() && line.back() == '\r') {
-            line.pop_back();
-        }
-        
-        // Skip empty lines
-        if (line.empty()) {
-            continue;
-        }
-        
-        // Parse LRC format: [mm:ss.xx]Lyric text
-        if (line.length() > 10 && line[0] == '[') {
-            size_t close_bracket = line.find(']');
-            if (close_bracket != std::string::npos) {
-                std::string tag_or_time = line.substr(1, close_bracket - 1);
-                std::string content = line.substr(close_bracket + 1);
-                
-                // Check if it's metadata instead of a timestamp
-                // Metadata tags are usually [ti:Title], [ar:Artist], [al:Album], etc.
-                size_t colon_pos = tag_or_time.find(':');
-                if (colon_pos != std::string::npos) {
-                    std::string left_part = tag_or_time.substr(0, colon_pos);
-                    
-                    // Check if the left part of the colon is a time (numeric)
-                    bool is_time_format = true;
-                    for (char c : left_part) {
-                        if (!isdigit(c)) {
-                            is_time_format = false;
-                            break;
-                        }
-                    }
-                    
-                    // If it's not a time format, skip this line (metadata tag)
-                    if (!is_time_format) {
-                        // Metadata like title, artist, etc., can be processed here
-                        ESP_LOGD(TAG, "Skipping metadata tag: [%s]", tag_or_time.c_str());
-                        continue;
-                    }
-                    
-                    // It's a time format, parse the timestamp
-                    try {
-                        int minutes = std::stoi(tag_or_time.substr(0, colon_pos));
-                        float seconds = std::stof(tag_or_time.substr(colon_pos + 1));
-                        int timestamp_ms = minutes * 60 * 1000 + (int)(seconds * 1000);
+    bool success = false;
+    cJSON* data = cJSON_GetObjectItem(json, "data");
+    if (data) {
+        cJSON* sentences = cJSON_GetObjectItem(data, "sentences");
+        if (cJSON_IsArray(sentences)) {
+            std::lock_guard<std::mutex> lock(lyrics_mutex_);
+            lyrics_.clear();
+            
+            int array_size = cJSON_GetArraySize(sentences);
+            for (int i = 0; i < array_size; i++) {
+                cJSON* sentence = cJSON_GetArrayItem(sentences, i);
+                if (sentence) {
+                    cJSON* words = cJSON_GetObjectItem(sentence, "words");
+                    if (cJSON_IsArray(words) && cJSON_GetArraySize(words) > 0) {
+                        cJSON* first_word = cJSON_GetArrayItem(words, 0);
+                        cJSON* start_time = cJSON_GetObjectItem(first_word, "startTime");
+                        cJSON* data_text = cJSON_GetObjectItem(first_word, "data");
                         
-                        // Safely handle lyric text, ensuring proper UTF-8 encoding
-                        std::string safe_lyric_text;
-                        if (!content.empty()) {
-                            // Create a safe copy and validate the string
-                            safe_lyric_text = content;
-                            // Ensure the string is null-terminated
-                            safe_lyric_text.shrink_to_fit();
+                        if (cJSON_IsNumber(start_time) && cJSON_IsString(data_text)) {
+                            // Build full sentence from all words
+                            std::string full_sentence;
+                            int word_count = cJSON_GetArraySize(words);
+                            for (int j = 0; j < word_count; j++) {
+                                cJSON* word = cJSON_GetArrayItem(words, j);
+                                cJSON* word_data = cJSON_GetObjectItem(word, "data");
+                                if (cJSON_IsString(word_data)) {
+                                    if (j > 0) full_sentence += " ";
+                                    full_sentence += word_data->valuestring;
+                                }
+                            }
+                            
+                            lyrics_.push_back(std::make_pair(start_time->valueint, full_sentence));
                         }
-                        
-                        lyrics_.push_back(std::make_pair(timestamp_ms, safe_lyric_text));
-                        
-                        if (!safe_lyric_text.empty()) {
-                            // Limit log output length to avoid truncation issues with non-ASCII characters
-                            size_t log_len = std::min(safe_lyric_text.length(), size_t(50));
-                            std::string log_text = safe_lyric_text.substr(0, log_len);
-                            ESP_LOGD(TAG, "Parsed lyric: [%d ms] %s", timestamp_ms, log_text.c_str());
-                        } else {
-                            ESP_LOGD(TAG, "Parsed lyric: [%d ms] (empty)", timestamp_ms);
-                        }
-                    } catch (const std::exception& e) {
-                        ESP_LOGW(TAG, "Failed to parse time: %s", tag_or_time.c_str());
                     }
                 }
             }
+            
+            ESP_LOGI(TAG, "Parsed %d lyric lines", lyrics_.size());
+            success = lyrics_.size() > 0;
         }
     }
     
-    // Sort by timestamp
-    std::sort(lyrics_.begin(), lyrics_.end());
-    
-    ESP_LOGI(TAG, "Parsed %d lyric lines", lyrics_.size());
-    return !lyrics_.empty();
+    cJSON_Delete(json);
+    return success;
 }
 
-// Lyric display thread
 void Esp32Music::LyricDisplayThread() {
-    ESP_LOGI(TAG, "Lyric display thread started");
+    ESP_LOGI(TAG, "Lyric thread started");
     
-    if (!DownloadLyrics(current_lyric_url_)) {
-        ESP_LOGE(TAG, "Failed to download or parse lyrics");
+    if (!GetLyrics(current_song_id_)) {
+        ESP_LOGW(TAG, "Failed to get lyrics");
         is_lyric_running_ = false;
         return;
     }
     
-    // Periodically check if the display needs to be updated (frequency can be reduced)
     while (is_lyric_running_ && is_playing_) {
-        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+        UpdateLyricDisplay(current_play_time_ms_);
+        vTaskDelay(pdMS_TO_TICKS(100));
     }
     
-    ESP_LOGI(TAG, "Lyric display thread finished");
+    ESP_LOGI(TAG, "Lyric thread finished");
 }
 
 void Esp32Music::UpdateLyricDisplay(int64_t current_time_ms) {
     std::lock_guard<std::mutex> lock(lyrics_mutex_);
     
-    if (lyrics_.empty()) {
-        return;
-    }
+    if (lyrics_.empty()) return;
     
-    // Find the current lyric to display
-    int new_lyric_index = -1;
-    
-    // Start searching from the current lyric index to improve efficiency
-    int start_index = (current_lyric_index_.load() >= 0) ? current_lyric_index_.load() : 0;
-    
-    // Forward search: find the last timestamp less than or equal to the current time
-    for (int i = start_index; i < (int)lyrics_.size(); i++) {
-        if (lyrics_[i].first <= current_time_ms) {
-            new_lyric_index = i;
+    int new_index = -1;
+    for (size_t i = 0; i < lyrics_.size(); i++) {
+        if (current_time_ms >= lyrics_[i].first) {
+            new_index = i;
         } else {
-            break;  // Timestamp exceeds the current time
+            break;
         }
     }
     
-    // If no lyric is found (e.g., current time is earlier than the first lyric), display nothing
-    if (new_lyric_index == -1) {
-        new_lyric_index = -1;
-    }
-    
-    // If the lyric index has changed, update the display
-    if (new_lyric_index != current_lyric_index_) {
-        current_lyric_index_ = new_lyric_index;
+    if (new_index != current_lyric_index_ && new_index >= 0) {
+        current_lyric_index_ = new_index;
         
-        auto& board = Board::GetInstance();
-        auto display = board.GetDisplay();
+        auto display = Board::GetInstance().GetDisplay();
         if (display) {
-            std::string lyric_text;
-            
-            if (current_lyric_index_ >= 0 && current_lyric_index_ < (int)lyrics_.size()) {
-                lyric_text = lyrics_[current_lyric_index_].second;
-            }
-            
-            // Display the lyric
-            display->SetChatMessage("lyric", lyric_text.c_str());
-            
-            ESP_LOGD(TAG, "Lyric update at %lldms: %s", 
-                    current_time_ms, 
-                    lyric_text.empty() ? "(no lyric)" : lyric_text.c_str());
+            std::string lyric_text = lyrics_[new_index].second;
+            display->SetMusicInfo(lyric_text.c_str());
+            ESP_LOGD(TAG, "Lyric: %s", lyric_text.c_str());
         }
     }
 }
 
-// Remove complex authentication initialization methods, use simple static functions
-
-// Remove complex class methods and use simple static functions
-
-/**
- *
- * @param http_client Pointer to the HTTP client
- * 
- * The added authentication headers include:
- * - X-MAC-Address: Device MAC address
- * - X-Chip-ID: Device chip ID
- * - X-Timestamp: Current timestamp
- * - X-Dynamic-Key: Dynamically generated key
- */
-// Removed the complex AddAuthHeaders method, using a simple static function
-
-// Removed complex authentication verification and configuration methods, using simple static functions
-
-// Implementation of display mode control methods
 void Esp32Music::SetDisplayMode(DisplayMode mode) {
-    DisplayMode old_mode = display_mode_.load();
     display_mode_ = mode;
-    
-    ESP_LOGI(TAG, "Display mode changed from %s to %s", 
-            (old_mode == DISPLAY_MODE_SPECTRUM) ? "SPECTRUM" : "LYRICS",
-            (mode == DISPLAY_MODE_SPECTRUM) ? "SPECTRUM" : "LYRICS");
+    ESP_LOGI(TAG, "Display mode set to: %s", 
+             mode == DISPLAY_MODE_SPECTRUM ? "SPECTRUM" : "LYRICS");
 }
 
 std::string Esp32Music::GetCheckMusicServerUrl() {
-    Settings settings("wifi", false);
-    std::string url = settings.GetString("music_url");
-    if (url.empty()) {
-        url = DEFAULT_MUSIC_URL;
+    // Try to get URL from settings first (using "music_url" key for compatibility)
+    std::string saved_url = Settings::GetString("music_url", "");
+    if (!saved_url.empty()) {
+        ESP_LOGI(TAG, "Using music server URL from settings: %s", saved_url.c_str());
+        return saved_url;
     }
-    return url;
+    
+    // Fallback to default ZingMP3 URL
+    ESP_LOGI(TAG, "Using default ZingMP3 URL: %s", DEFAULT_ZINGMP3_URL);
+    return DEFAULT_ZINGMP3_URL;
 }

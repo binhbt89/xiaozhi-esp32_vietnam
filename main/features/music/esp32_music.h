@@ -25,28 +25,47 @@ struct AudioChunk {
     AudioChunk(uint8_t* d, size_t s) : data(d), size(s) {}
 };
 
+// Song information structure
+struct SongInfo {
+    std::string encodeId;
+    std::string title;
+    std::string artist;
+    int duration;
+    std::string thumbnailUrl;
+    
+    SongInfo() : duration(0) {}
+};
+
 class Esp32Music : public Music {
 public:
-    // Display mode control - moved to public section
+    // Display mode control
     enum DisplayMode {
         DISPLAY_MODE_SPECTRUM = 0,  // Default: display spectrum
         DISPLAY_MODE_LYRICS = 1     // Display lyrics
     };
+    
+    // Audio quality options
+    enum AudioQuality {
+        QUALITY_128 = 0,    // 128kbps (always available)
+        QUALITY_320 = 1,    // 320kbps (VIP required)
+        QUALITY_LOSSLESS = 2 // FLAC (VIP required)
+    };
 
 private:
+    std::string zingmp3_server_url_;
     std::string last_downloaded_data_;
     std::string current_music_url_;
-	std::string artist_name_;   
-    std::string title_name_;
-    std::string current_song_name_;
+    std::string current_song_id_;
+    SongInfo current_song_info_;
     bool song_name_displayed_;
-	bool full_info_displayed_;
-	bool fft_started_ = false;
+    bool full_info_displayed_;
+    bool fft_started_;
+    AudioQuality preferred_quality_;
     
     // Lyrics-related
     std::string current_lyric_url_;
-    std::vector<std::pair<int, std::string>> lyrics_;  // Timestamp and lyric text
-    std::mutex lyrics_mutex_;  // Mutex to protect the lyrics_ array
+    std::vector<std::pair<int, std::string>> lyrics_;  // Timestamp (ms) and lyric text
+    std::mutex lyrics_mutex_;
     std::atomic<int> current_lyric_index_;
     std::thread lyric_thread_;
     std::atomic<bool> is_lyric_running_;
@@ -56,17 +75,17 @@ private:
     std::atomic<bool> is_downloading_;
     std::thread play_thread_;
     std::thread download_thread_;
-    int64_t current_play_time_ms_;  // Current playback time (milliseconds)
-    int64_t last_frame_time_ms_;    // Timestamp of the last frame
-    int total_frames_decoded_;      // Total number of decoded frames
+    int64_t current_play_time_ms_;
+    int64_t last_frame_time_ms_;
+    int total_frames_decoded_;
 
     // Audio buffer
     std::queue<AudioChunk> audio_buffer_;
     std::mutex buffer_mutex_;
     std::condition_variable buffer_cv_;
     size_t buffer_size_;
-    static constexpr size_t MAX_BUFFER_SIZE = 256 * 1024;  // 256KB buffer (reduced to minimize brownout risk)
-    static constexpr size_t MIN_BUFFER_SIZE = 32 * 1024;   // 32KB minimum playback buffer (reduced to minimize brownout risk)
+    static constexpr size_t MAX_BUFFER_SIZE = 256 * 1024;  // 256KB buffer
+    static constexpr size_t MIN_BUFFER_SIZE = 32 * 1024;   // 32KB minimum playback buffer
     
     // MP3 decoder-related
     HMP3Decoder mp3_decoder_;
@@ -79,16 +98,24 @@ private:
     void ClearAudioBuffer();
     bool InitializeMp3Decoder();
     void CleanupMp3Decoder();
-    void ResetSampleRate();  // Reset sample rate to the original value
+    void ResetSampleRate();
+    
+    // ZingMP3 API methods
+    bool SearchSong(const std::string& query, SongInfo& song_info);
+    bool GetSongInfo(const std::string& song_id, SongInfo& song_info);
+    bool GetStreamUrl(const std::string& song_id, AudioQuality quality, std::string& stream_url);
+    bool GetLyrics(const std::string& song_id);
     
     // Lyrics-related private methods
-    bool DownloadLyrics(const std::string& lyric_url);
-    bool ParseLyrics(const std::string& lyric_content);
+    bool ParseZingMp3Lyrics(const std::string& lyric_json);
     void LyricDisplayThread();
     void UpdateLyricDisplay(int64_t current_time_ms);
     
     // ID3 tag handling
     size_t SkipId3Tag(uint8_t* data, size_t size);
+    
+    // Helper methods
+    std::string GetQualityString(AudioQuality quality);
 
     int16_t* final_pcm_data_fft = nullptr;
 
@@ -98,13 +125,11 @@ public:
 
     void Initialize();
 
+    // Override Music interface methods
     virtual bool Download(const std::string& song_name, const std::string& artist_name) override;
-  
     virtual std::string GetDownloadResult() override;
-    
-    // New methods
     virtual bool StartStreaming(const std::string& music_url) override;
-    virtual bool StopStreaming() override;  // Stop streaming playback
+    virtual bool StopStreaming() override;
     virtual size_t GetBufferSize() const override { return buffer_size_; }
     virtual bool IsDownloading() const override { return is_downloading_; }
     virtual int16_t* GetAudioData() override { return final_pcm_data_fft; }
@@ -113,7 +138,15 @@ public:
     // Display mode control methods
     void SetDisplayMode(DisplayMode mode);
     DisplayMode GetDisplayMode() const { return display_mode_.load(); }
-    std::string GetCheckMusicServerUrl();
+    
+    // Quality control methods
+    void SetPreferredQuality(AudioQuality quality) { preferred_quality_ = quality; }
+    AudioQuality GetPreferredQuality() const { return preferred_quality_; }
+    
+    // Server URL configuration
+    void SetServerUrl(const std::string& url) { zingmp3_server_url_ = url; }
+    std::string GetServerUrl() const { return zingmp3_server_url_; }
+    std::string GetCheckMusicServerUrl();  // Get URL from settings or default
 };
 
 #endif // ESP32_MUSIC_H
