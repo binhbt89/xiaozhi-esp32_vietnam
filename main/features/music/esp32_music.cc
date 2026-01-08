@@ -1043,7 +1043,8 @@ void Esp32Music::SetDisplayMode(DisplayMode mode) {
 
 std::string Esp32Music::GetCheckMusicServerUrl() {
     // Try to get URL from settings first (using "music_url" key for compatibility)
-    std::string saved_url = Settings::GetString("music_url", "");
+    Settings settings("wifi", false);
+    std::string saved_url = settings.GetString("music_url", "");
     if (!saved_url.empty()) {
         ESP_LOGI(TAG, "Using music server URL from settings: %s", saved_url.c_str());
         return saved_url;
