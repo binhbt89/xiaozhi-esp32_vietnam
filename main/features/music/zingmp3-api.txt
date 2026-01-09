@@ -1,0 +1,549 @@
+================================================================================
+                       ZING MP3 API DOCUMENTATION
+================================================================================
+
+Server: Express.js (Node.js)
+Base URL: http://localhost:5555
+Source File: dist/index.js (ZingMp3Api class)
+Setup File: server.js
+
+================================================================================
+                           ARCHITECTURE OVERVIEW
+================================================================================
+
+This service wraps the official Zing MP3 API (https://zingmp3.vn).
+
+Key Features:
+- Uses HMAC-SHA512 signature for API authentication
+- Automatic cookie management for session handling
+- Proxies all requests through the Node.js server
+
+Configuration (hardcoded in dist/index.js):
+- VERSION: 1.6.34
+- API_KEY: 88265e23d4284f25963e6eedac8fbfa3
+- SECRET_KEY: 2aa2d1c561e809b267f3638c4a307aab
+
+================================================================================
+                              API ENDPOINTS
+================================================================================
+
+--------------------------------------------------------------------------------
+1. GET HOME PAGE
+--------------------------------------------------------------------------------
+Endpoint:   GET /api/home
+Description: Get home page data with featured content, playlists, etc.
+
+Query Parameters: None
+
+Response Success:
+{
+  "err": 0,
+  "msg": "Success",
+  "data": {
+    "items": [...],      // Featured sections, banners, playlists
+    "hasMore": true,
+    "total": 30
+  }
+}
+
+Example:
+  GET /api/home
+
+--------------------------------------------------------------------------------
+2. GET TOP 100
+--------------------------------------------------------------------------------
+Endpoint:   GET /api/top100
+Description: Get Top 100 playlists by genre
+
+Query Parameters: None
+
+Response Success:
+{
+  "err": 0,
+  "msg": "Success",
+  "data": [
+    {
+      "genre": {
+        "name": "Nhạc Trẻ",
+        ...
+      },
+      "items": [...]    // List of playlists
+    }
+  ]
+}
+
+Example:
+  GET /api/top100
+
+--------------------------------------------------------------------------------
+3. GET CHART HOME
+--------------------------------------------------------------------------------
+Endpoint:   GET /api/chart-home
+Description: Get ZingChart home data with rankings
+
+Query Parameters: None
+
+Response Success:
+{
+  "err": 0,
+  "msg": "Success",
+  "data": {
+    "RTChart": {
+      "items": [...],   // Ranked songs
+      "chart": {...}    // Chart data points
+    },
+    "weekChart": {...}  // Weekly charts by region
+  }
+}
+
+Example:
+  GET /api/chart-home
+
+--------------------------------------------------------------------------------
+4. GET NEW RELEASE CHART
+--------------------------------------------------------------------------------
+Endpoint:   GET /api/newrelease-chart
+Description: Get newly released songs chart
+
+Query Parameters: None
+
+Response Success:
+{
+  "err": 0,
+  "msg": "Success",
+  "data": {
+    "items": [...],     // New release songs
+    "total": 100
+  }
+}
+
+Example:
+  GET /api/newrelease-chart
+
+--------------------------------------------------------------------------------
+5. SEARCH
+--------------------------------------------------------------------------------
+Endpoint:   GET /api/search
+Description: Search for songs, artists, albums, playlists
+
+Query Parameters:
+  - q (required) : Search query string
+
+Response Success:
+{
+  "err": 0,
+  "msg": "Success",
+  "data": {
+    "top": {...},           // Top result
+    "songs": [...],         // Matching songs
+    "artists": [...],       // Matching artists
+    "playlists": [...],     // Matching playlists
+    "videos": [...]         // Matching MVs
+  }
+}
+
+Response Error:
+{
+  "error": "Missing q"
+}
+
+Example:
+  GET /api/search?q=sơn+tùng
+
+--------------------------------------------------------------------------------
+6. GET SONG (STREAMING URL)
+--------------------------------------------------------------------------------
+Endpoint:   GET /api/song
+Description: Get streaming URLs for a song
+
+Query Parameters:
+  - id (required) : Zing MP3 song ID (encodeId)
+
+Response Success:
+{
+  "err": 0,
+  "msg": "Success",
+  "data": {
+    "128": "https://...",     // 128kbps MP3 URL
+    "320": "https://...",     // 320kbps MP3 URL (VIP)
+    "lossless": "https://..." // FLAC URL (VIP)
+  }
+}
+
+Response Error:
+{
+  "error": "Missing id"
+}
+
+Example:
+  GET /api/song?id=ZW6AOCAZ
+
+Note: 320kbps and lossless require VIP account (may return VIP error)
+
+--------------------------------------------------------------------------------
+7. GET SONG STREAM (REDIRECT)
+--------------------------------------------------------------------------------
+Endpoint:   GET /api/song/stream
+Description: Redirect directly to stream URL (for audio playback)
+
+Query Parameters:
+  - id      (required) : Zing MP3 song ID
+  - quality (optional) : Quality - '128', '320', 'lossless' (default: '128')
+
+Response:
+  - HTTP 302 Redirect to the stream URL
+
+Response Error:
+{
+  "error": "Stream URL not found for quality [quality]"
+}
+
+Example:
+  GET /api/song/stream?id=ZW6AOCAZ&quality=128
+
+Use Case:
+  Direct playback in <audio> HTML elements or embedded players
+
+--------------------------------------------------------------------------------
+8. GET SONG INFO
+--------------------------------------------------------------------------------
+Endpoint:   GET /api/info-song
+Description: Get detailed information about a song
+
+Query Parameters:
+  - id (required) : Zing MP3 song ID
+
+Response Success:
+{
+  "err": 0,
+  "msg": "Success",
+  "data": {
+    "encodeId": "ZW6AOCAZ",
+    "title": "Song Title",
+    "alias": "song-title",
+    "duration": 240,
+    "artistsNames": "Artist Name",
+    "artists": [...],
+    "thumbnailM": "https://...",
+    "album": {...},
+    "genres": [...],
+    "listen": 1234567,
+    "like": 12345
+  }
+}
+
+Example:
+  GET /api/info-song?id=ZW6AOCAZ
+
+--------------------------------------------------------------------------------
+9. GET LYRIC
+--------------------------------------------------------------------------------
+Endpoint:   GET /api/lyric
+Description: Get synchronized lyrics for a song
+
+Query Parameters:
+  - id (required) : Zing MP3 song ID
+
+Response Success:
+{
+  "err": 0,
+  "msg": "Success",
+  "data": {
+    "sentences": [
+      {
+        "words": [
+          { "startTime": 1000, "endTime": 1500, "data": "Hello" }
+        ]
+      }
+    ],
+    "file": "https://..."    // LRC file URL
+  }
+}
+
+Example:
+  GET /api/lyric?id=ZW6AOCAZ
+
+--------------------------------------------------------------------------------
+10. GET PLAYLIST DETAIL
+--------------------------------------------------------------------------------
+Endpoint:   GET /api/detail-playlist
+Description: Get detailed information about a playlist/album
+
+Query Parameters:
+  - id (required) : Zing MP3 playlist ID
+
+Response Success:
+{
+  "err": 0,
+  "msg": "Success",
+  "data": {
+    "encodeId": "ZWZB969E",
+    "title": "Playlist Title",
+    "thumbnail": "https://...",
+    "song": {
+      "items": [...],     // List of songs
+      "total": 50
+    },
+    "artists": [...],
+    "description": "...",
+    "like": 12345
+  }
+}
+
+Example:
+  GET /api/detail-playlist?id=ZWZB969E
+
+--------------------------------------------------------------------------------
+11. GET ARTIST
+--------------------------------------------------------------------------------
+Endpoint:   GET /api/artist
+Description: Get artist page data
+
+Query Parameters:
+  - name (required) : Artist alias/name (e.g., "Son-Tung-M-TP")
+
+Response Success:
+{
+  "err": 0,
+  "msg": "Success",
+  "data": {
+    "id": "IWZ97I0W",
+    "name": "Sơn Tùng M-TP",
+    "alias": "Son-Tung-M-TP",
+    "thumbnail": "https://...",
+    "biography": "...",
+    "sections": [
+      {
+        "title": "Bài hát nổi bật",
+        "items": [...]
+      }
+    ],
+    "totalFollow": 1234567
+  }
+}
+
+Example:
+  GET /api/artist?name=Son-Tung-M-TP
+
+--------------------------------------------------------------------------------
+12. GET ARTIST SONGS
+--------------------------------------------------------------------------------
+Endpoint:   GET /api/artist-songs
+Description: Get paginated list of songs by an artist
+
+Query Parameters:
+  - id    (required) : Artist ID
+  - page  (optional) : Page number (default: '1')
+  - count (optional) : Items per page (default: '15')
+
+Response Success:
+{
+  "err": 0,
+  "msg": "Success",
+  "data": {
+    "items": [...],       // List of songs
+    "hasMore": true,
+    "total": 100
+  }
+}
+
+Example:
+  GET /api/artist-songs?id=IWZ97I0W&page=1&count=15
+
+--------------------------------------------------------------------------------
+13. GET VIDEO (MV)
+--------------------------------------------------------------------------------
+Endpoint:   GET /api/video
+Description: Get MV/video details and streaming URLs
+
+Query Parameters:
+  - id (required) : Video/MV ID
+
+Response Success:
+{
+  "err": 0,
+  "msg": "Success",
+  "data": {
+    "encodeId": "ZW6BAWAC",
+    "title": "MV Title",
+    "thumbnail": "https://...",
+    "streaming": {
+      "mp4": {
+        "360p": "https://...",
+        "480p": "https://...",
+        "720p": "https://..."
+      }
+    },
+    "artist": {...}
+  }
+}
+
+Example:
+  GET /api/video?id=ZW6BAWAC
+
+--------------------------------------------------------------------------------
+14. GET LIST MV
+--------------------------------------------------------------------------------
+Endpoint:   GET /api/list-mv
+Description: Get paginated list of MVs by genre
+
+Query Parameters:
+  - id    (required) : Genre ID
+  - page  (optional) : Page number (default: '1')
+  - count (optional) : Items per page (default: '15')
+
+Response Success:
+{
+  "err": 0,
+  "msg": "Success",
+  "data": {
+    "items": [...],       // List of MVs
+    "hasMore": true,
+    "total": 100
+  }
+}
+
+Example:
+  GET /api/list-mv?id=IWZ9Z08I&page=1&count=15
+
+--------------------------------------------------------------------------------
+15. GET CATEGORY MV
+--------------------------------------------------------------------------------
+Endpoint:   GET /api/category-mv
+Description: Get MV category/genre information
+
+Query Parameters:
+  - id (required) : Category ID
+
+Response Success:
+{
+  "err": 0,
+  "msg": "Success",
+  "data": {
+    "id": "IWZ9Z08I",
+    "name": "Nhạc Trẻ",
+    "alias": "nhac-tre",
+    "childs": [...],      // Sub-categories
+    "playlists": [...]
+  }
+}
+
+Example:
+  GET /api/category-mv?id=IWZ9Z08I
+
+--------------------------------------------------------------------------------
+16. HEALTH CHECK
+--------------------------------------------------------------------------------
+Endpoint:   GET /health
+Description: Check if server is running
+
+Response:
+{
+  "ok": true
+}
+
+================================================================================
+                           ERROR HANDLING
+================================================================================
+
+All endpoints return consistent error responses:
+
+HTTP 400 - Bad Request (Missing parameters):
+{
+  "error": "Missing [parameter_name]"
+}
+
+HTTP 500 - Internal Server Error:
+{
+  "error": "Error message description"
+}
+
+Zing MP3 API Error Codes (in response body):
+{
+  "err": -1,
+  "msg": "Error message"
+}
+
+Common error codes:
+- err: 0   = Success
+- err: -1  = General error
+- err: -201 = Content not available
+- err: -301 = VIP required (for 320kbps/lossless)
+
+================================================================================
+                         INTERNAL METHODS (ZingMp3Api Class)
+================================================================================
+
+The ZingMp3Api class in dist/index.js provides these internal methods:
+
+Authentication:
+- getHash256(str)           : SHA-256 hash
+- getHmac512(str, key)      : HMAC-SHA512 signature
+- hashParam(path, id)       : Generate signature with ID
+- hashParamNoId(path)       : Generate signature without ID
+- hashParamHome(path)       : Generate signature for home page
+- hashCategoryMV(path,id,type) : Generate signature for MV category
+- hashListMV(path,id,type,page,count) : Generate signature for MV list
+
+HTTP:
+- getCookie()               : Get session cookie from Zing MP3
+- requestZingMp3(path, qs)  : Make authenticated request to Zing MP3
+
+Public Methods:
+- getSong(songId)           : Get streaming URLs
+- getDetailPlaylist(playlistId) : Get playlist details
+- getHome()                 : Get home page
+- getTop100()               : Get Top 100 playlists
+- getChartHome()            : Get chart data
+- getNewReleaseChart()      : Get new releases
+- getInfoSong(songId)       : Get song info
+- getListArtistSong(artistId, page, count) : Get artist songs
+- getArtist(name)           : Get artist page
+- getLyric(songId)          : Get lyrics
+- search(name)              : Search all content
+- getListMV(id, page, count): Get MV list by genre
+- getCategoryMV(id)         : Get MV category
+- getVideo(videoId)         : Get video/MV details
+
+================================================================================
+                            DEPENDENCIES
+================================================================================
+
+Node.js Dependencies:
+  - axios: HTTP client for API requests
+  - crypto: Built-in module for HMAC/SHA signatures
+  - express: HTTP server framework
+
+================================================================================
+                       SAMPLE ZING MP3 IDS
+================================================================================
+
+Song IDs (encodeId):
+  - ZW6AOCAZ (example)
+  - Use /api/search to find song IDs
+
+Playlist IDs:
+  - ZWZB969E (example - Top 100 Nhạc Trẻ)
+  - Use /api/top100 to find playlist IDs
+
+Artist Aliases:
+  - Son-Tung-M-TP
+  - Hoang-Thuy-Linh
+  - Use /api/search to find artist aliases
+
+================================================================================
+                              NOTES
+================================================================================
+
+1. All streaming URLs from Zing MP3 are time-limited and will expire.
+
+2. 320kbps and lossless quality require a VIP subscription.
+   Without VIP, only 128kbps is available.
+
+3. Use /api/song/stream for direct audio playback to avoid CORS issues.
+
+4. Cookie session is automatically managed by the ZingMp3Api class.
+
+5. The CTIME parameter is generated server-side using current timestamp.
+
+================================================================================

@@ -107,7 +107,8 @@ private:
     bool GetLyrics(const std::string& song_id);
     
     // Lyrics-related private methods
-    bool ParseZingMp3Lyrics(const std::string& lyric_json);
+    bool DownloadAndParseLrc(const std::string& lrc_url);
+    bool ParseLrc(const std::string& lrc_content);
     void LyricDisplayThread();
     void UpdateLyricDisplay(int64_t current_time_ms);
     
@@ -116,6 +117,18 @@ private:
     
     // Helper methods
     std::string GetQualityString(AudioQuality quality);
+
+    // Bass Boost Filter State
+    struct BassBoostState {
+        float x1 = 0, x2 = 0;
+        float y1 = 0, y2 = 0;
+        // Coefficients
+        float b0 = 1, b1 = 0, b2 = 0;
+        float a1 = 0, a2 = 0;
+    } bass_filter_;
+
+    void InitBassBoost(int sample_rate);
+    int16_t ProcessBassBoost(int16_t sample);
 
     int16_t* final_pcm_data_fft = nullptr;
 
