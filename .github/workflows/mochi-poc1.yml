@@ -1,9 +1,9 @@
-name: Mochi POC1
+name: Mochi POC2
 
 on:
   push:
     branches:
-      - ci/mochi-poc1
+      - ci/mochi-poc2
   workflow_dispatch:
 
 permissions:
@@ -11,7 +11,7 @@ permissions:
 
 jobs:
   build:
-    name: Build Mochi POC1.4 final display QA for 1.83 TFT
+    name: Build Mochi POC2 living pet UI for 1.83 TFT
     runs-on: ubuntu-latest
     container:
       image: espressif/idf:release-v5.5
@@ -19,13 +19,15 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Apply final display QA board/runtime fixes
+      - name: Apply proven display baseline and Mochi POC2 UI
         shell: bash
         run: |
           python - <<'PY'
           from pathlib import Path
 
-          # Keep the orientation proven correct by POC1.3.
+          # -------------------------------------------------------------
+          # 1) KEEP THE POC1.4 DISPLAY BASELINE THAT PASSED ON REAL HW
+          # -------------------------------------------------------------
           cfg = Path('main/boards/xingzhi-cube-1.83tft-wifi/config.h')
           s = cfg.read_text(encoding='utf-8')
           repl = {
@@ -39,44 +41,84 @@ jobs:
               s = s.replace(old, new, 1)
           cfg.write_text(s, encoding='utf-8')
 
-          # ST7789 has 320-line GRAM while this glass exposes 284 pixels on the
-          # swapped axis. Apply the missing controller gap instead of moving LVGL.
           board = Path('main/boards/xingzhi-cube-1.83tft-wifi/xingzhi-cube-1.83tft-wifi.cc')
           s = board.read_text(encoding='utf-8')
           anchor = '        ESP_ERROR_CHECK(esp_lcd_panel_init(panel_));\n'
-          insert = anchor + '        ESP_ERROR_CHECK(esp_lcd_panel_set_gap(panel_, 36, 0)); // Mochi POC1.4: physical ST7789 GRAM gap\n'
+          insert = anchor + '        ESP_ERROR_CHECK(esp_lcd_panel_set_gap(panel_, 36, 0)); // Mochi: proven physical ST7789 GRAM gap\n'
           if anchor not in s:
               raise SystemExit('panel init anchor not found')
           s = s.replace(anchor, insert, 1)
           board.write_text(s, encoding='utf-8')
 
+          # -------------------------------------------------------------
+          # 2) STABLE RUNTIME BASELINE + STATE -> MOCHI EXPRESSIONS
+          # -------------------------------------------------------------
           app = Path('main/application.cc')
           s = app.read_text(encoding='utf-8')
 
-          # Never let a public-source QA build overwrite itself by OTA.
           old = 'if (ota.HasNewVersion()) {'
-          new = 'if (false && ota.HasNewVersion()) { // Mochi POC1.4 QA: no automatic firmware replacement'
+          new = 'if (false && ota.HasNewVersion()) { // Mochi POC2: no automatic firmware replacement'
           if old not in s:
-              raise SystemExit('OTA upgrade anchor not found')
+              raise SystemExit('OTA anchor not found')
           s = s.replace(old, new, 1)
 
-          # Keep wakeword completely off during this display/stability gate. The
-          # front button remains the only chat trigger, removing ESP-SR model
-          # compatibility as a confounding variable.
           old_idle = 'audio_service_.EnableVoiceProcessing(false);\n            audio_service_.EnableWakeWordDetection(true);'
-          new_idle = 'audio_service_.EnableVoiceProcessing(false);\n            audio_service_.EnableWakeWordDetection(false); // POC1.4 QA: button-to-talk only'
+          new_idle = 'audio_service_.EnableVoiceProcessing(false);\n            audio_service_.EnableWakeWordDetection(false); // Mochi POC2: keep proven button-to-talk baseline'
           if old_idle not in s:
               raise SystemExit('idle wakeword anchor not found')
           s = s.replace(old_idle, new_idle, 1)
 
           old_speaking = 'audio_service_.EnableWakeWordDetection(audio_service_.IsAfeWakeWord());'
-          new_speaking = 'audio_service_.EnableWakeWordDetection(false); // POC1.4 QA: button-to-talk only'
+          new_speaking = 'audio_service_.EnableWakeWordDetection(false); // Mochi POC2: keep proven button-to-talk baseline'
           if old_speaking not in s:
               raise SystemExit('speaking wakeword anchor not found')
           s = s.replace(old_speaking, new_speaking, 1)
 
+          old_connect = '''        case kDeviceStateConnecting:\n            display->SetStatus(Lang::Strings::CONNECTING);\n            display->SetEmotion("neutral");\n            display->SetChatMessage("system", "");'''
+          new_connect = '''        case kDeviceStateConnecting:\n            display->SetStatus(Lang::Strings::CONNECTING);\n            display->SetEmotion("thinking");\n            display->SetChatMessage("system", "");'''
+          if old_connect not in s:
+              raise SystemExit('connecting state anchor not found')
+          s = s.replace(old_connect, new_connect, 1)
+
+          old_listen = '''        case kDeviceStateListening:\n            display->SetStatus(Lang::Strings::LISTENING);\n            display->SetEmotion("neutral");'''
+          new_listen = '''        case kDeviceStateListening:\n            display->SetStatus(Lang::Strings::LISTENING);\n            display->SetEmotion("surprised");'''
+          if old_listen not in s:
+              raise SystemExit('listening state anchor not found')
+          s = s.replace(old_listen, new_listen, 1)
+
+          old_speak_state = '''        case kDeviceStateSpeaking:\n            display->SetStatus(Lang::Strings::SPEAKING);\n\n            if (listening_mode_ != kListeningModeRealtime) {'''
+          new_speak_state = '''        case kDeviceStateSpeaking:\n            display->SetStatus(Lang::Strings::SPEAKING);\n            display->SetEmotion("happy");\n\n            if (listening_mode_ != kListeningModeRealtime) {'''
+          if old_speak_state not in s:
+              raise SystemExit('speaking state anchor not found')
+          s = s.replace(old_speak_state, new_speak_state, 1)
           app.write_text(s, encoding='utf-8')
-          print('POC1.4: orientation locked; physical panel gap=36,0; OTA/wakeword isolated')
+
+          # -------------------------------------------------------------
+          # 3) PET SCENE LAYOUT: BUBBLE TOP, MOCHI GROUNDED AT BOTTOM
+          # -------------------------------------------------------------
+          lcd = Path('main/display/lcd_display.cc')
+          s = lcd.read_text(encoding='utf-8')
+
+          old_layout = '''    lv_obj_set_flex_flow(content_, LV_FLEX_FLOW_COLUMN); // Vertical layout (top to bottom)\n    lv_obj_set_flex_align(content_, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_SPACE_EVENLY); // Center-align child objects, evenly spaced\n\n    emoji_box_ = lv_obj_create(content_);\n    lv_obj_set_size(emoji_box_, LV_SIZE_CONTENT, LV_SIZE_CONTENT);\n    lv_obj_set_style_bg_opa(emoji_box_, LV_OPA_TRANSP, 0);\n    lv_obj_set_style_pad_all(emoji_box_, 0, 0);\n    lv_obj_set_style_border_width(emoji_box_, 0, 0);'''
+          new_layout = '''    // Mochi POC2: absolute pet scene instead of flex-centering the pet.\n    // The wide neutral GIF animates inside this floor-level box.\n    emoji_box_ = lv_obj_create(content_);\n    lv_obj_set_size(emoji_box_, 224, 100);\n    lv_obj_align(emoji_box_, LV_ALIGN_BOTTOM_MID, 0, -2);\n    lv_obj_set_style_bg_opa(emoji_box_, LV_OPA_TRANSP, 0);\n    lv_obj_set_style_pad_all(emoji_box_, 0, 0);\n    lv_obj_set_style_border_width(emoji_box_, 0, 0);\n    lv_obj_set_scrollbar_mode(emoji_box_, LV_SCROLLBAR_MODE_OFF);'''
+          if old_layout not in s:
+              raise SystemExit('pet layout anchor not found')
+          s = s.replace(old_layout, new_layout, 1)
+
+          old_chat = '''    chat_message_label_ = lv_label_create(content_);\n    lv_label_set_text(chat_message_label_, "");\n    lv_obj_set_width(chat_message_label_, width_ * 0.9); // Limit width to 90% of screen width\n    lv_label_set_long_mode(chat_message_label_, LV_LABEL_LONG_WRAP); // Set to word-wrap mode\n    lv_obj_set_style_text_align(chat_message_label_, LV_TEXT_ALIGN_CENTER, 0); // Set text alignment to center\n    lv_obj_set_style_text_color(chat_message_label_, lvgl_theme->text_color(), 0);'''
+          new_chat = '''    // Mochi POC2: one compact speech bubble in the upper scene.\n    chat_message_label_ = lv_label_create(content_);\n    lv_label_set_text(chat_message_label_, "");\n    lv_obj_set_width(chat_message_label_, width_ * 86 / 100);\n    lv_label_set_long_mode(chat_message_label_, LV_LABEL_LONG_WRAP);\n    lv_obj_set_style_text_align(chat_message_label_, LV_TEXT_ALIGN_CENTER, 0);\n    lv_obj_set_style_text_color(chat_message_label_, lv_color_hex(0x314968), 0);\n    lv_obj_set_style_bg_color(chat_message_label_, lv_color_hex(0xFFF1DC), 0);\n    lv_obj_set_style_bg_opa(chat_message_label_, LV_OPA_90, 0);\n    lv_obj_set_style_radius(chat_message_label_, 12, 0);\n    lv_obj_set_style_border_width(chat_message_label_, 1, 0);\n    lv_obj_set_style_border_color(chat_message_label_, lv_color_hex(0x9CB6CE), 0);\n    lv_obj_set_style_pad_all(chat_message_label_, 7, 0);\n    lv_obj_align(chat_message_label_, LV_ALIGN_TOP_MID, 0, 6);\n    lv_obj_add_flag(chat_message_label_, LV_OBJ_FLAG_HIDDEN);'''
+          if old_chat not in s:
+              raise SystemExit('chat label anchor not found')
+          s = s.replace(old_chat, new_chat, 1)
+
+          old_setchat = '''void LcdDisplay::SetChatMessage(const char* role, const char* content) {\n    DisplayLockGuard lock(this);\n    if (chat_message_label_ == nullptr) {\n        return;\n    }\n    lv_label_set_text(chat_message_label_, content);\n}'''
+          new_setchat = '''void LcdDisplay::SetChatMessage(const char* role, const char* content) {\n    DisplayLockGuard lock(this);\n    if (chat_message_label_ == nullptr) {\n        return;\n    }\n\n    if (content == nullptr || content[0] == '\\0') {\n        lv_label_set_text(chat_message_label_, "");\n        lv_obj_add_flag(chat_message_label_, LV_OBJ_FLAG_HIDDEN);\n        return;\n    }\n\n    // Gentle role tint while keeping one consistent speech-bubble design.\n    if (role != nullptr && strcmp(role, "user") == 0) {\n        lv_obj_set_style_bg_color(chat_message_label_, lv_color_hex(0xDDEEFF), 0);\n    } else if (role != nullptr && strcmp(role, "system") == 0) {\n        lv_obj_set_style_bg_color(chat_message_label_, lv_color_hex(0xE9EEF4), 0);\n    } else {\n        lv_obj_set_style_bg_color(chat_message_label_, lv_color_hex(0xFFF1DC), 0);\n    }\n\n    lv_label_set_text(chat_message_label_, content);\n    lv_obj_remove_flag(chat_message_label_, LV_OBJ_FLAG_HIDDEN);\n    lv_obj_align(chat_message_label_, LV_ALIGN_TOP_MID, 0, 6);\n    lv_obj_move_foreground(chat_message_label_);\n}'''
+          if old_setchat not in s:
+              raise SystemExit('SetChatMessage anchor not found')
+          s = s.replace(old_setchat, new_setchat, 1)
+
+          lcd.write_text(s, encoding='utf-8')
+          print('POC2 patch: display baseline locked; pet grounded; top speech bubble; state expressions mapped')
           PY
 
       - name: Match current 16MB device partition layout
@@ -119,10 +161,10 @@ jobs:
           source $IDF_PATH/export.sh
           python scripts/release.py xingzhi-cube-1.83tft-wifi --name xingzhi-cube-1.83tft-wifi
 
-      - name: Upload merged firmware
+      - name: Upload firmware
         uses: actions/upload-artifact@v4
         with:
-          name: mochi-poc14-${{ github.sha }}
+          name: mochi-poc2-${{ github.sha }}
           path: |
             build/merged-binary.bin
             build/partition_table/partition-table.bin
