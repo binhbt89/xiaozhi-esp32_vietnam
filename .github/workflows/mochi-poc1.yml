@@ -23,7 +23,7 @@ jobs:
         shell: bash
         run: python scripts/apply_mochi_poc1.py
 
-      - name: Match tested hardware orientation and keep OTA from replacing POC
+      - name: Match tested hardware orientation and stabilize idle mode
         shell: bash
         run: |
           python - <<'PY'
@@ -31,21 +31,35 @@ jobs:
 
           cfg = Path('main/boards/xingzhi-cube-1.83tft-wifi/config.h')
           s = cfg.read_text(encoding='utf-8')
-          old = '#define DISPLAY_SWAP_XY  false'
-          new = '#define DISPLAY_SWAP_XY  true'
-          if old not in s:
-              raise SystemExit('DISPLAY_SWAP_XY anchor not found')
-          cfg.write_text(s.replace(old, new, 1), encoding='utf-8')
-          print('ST7789 logical 284x240 now uses XY swap for physical 240x284 panel')
+          repl = {
+              '#define DISPLAY_SWAP_XY  false': '#define DISPLAY_SWAP_XY  true',
+              '#define DISPLAY_MIRROR_X false': '#define DISPLAY_MIRROR_X true',
+              '#define DISPLAY_MIRROR_Y false': '#define DISPLAY_MIRROR_Y true',
+          }
+          for old, new in repl.items():
+              if old not in s:
+                  raise SystemExit(f'orientation anchor not found: {old}')
+              s = s.replace(old, new, 1)
+          cfg.write_text(s, encoding='utf-8')
+          print('ST7789: swap XY + mirror X/Y to correct the observed 180-degree image')
 
           app = Path('main/application.cc')
           s = app.read_text(encoding='utf-8')
+
           old = 'if (ota.HasNewVersion()) {'
           new = 'if (false && ota.HasNewVersion()) { // Mochi POC: never auto-replace test firmware'
           if old not in s:
               raise SystemExit('OTA upgrade anchor not found')
-          app.write_text(s.replace(old, new, 1), encoding='utf-8')
-          print('OTA metadata/broker check preserved; automatic firmware replacement disabled for POC')
+          s = s.replace(old, new, 1)
+
+          old_idle = 'audio_service_.EnableVoiceProcessing(false);\n            audio_service_.EnableWakeWordDetection(true);'
+          new_idle = 'audio_service_.EnableVoiceProcessing(false);\n            audio_service_.EnableWakeWordDetection(false); // POC1.2: button-to-talk only; avoid idle wakeword reset/reconnect loop'
+          if old_idle not in s:
+              raise SystemExit('idle wakeword anchor not found')
+          s = s.replace(old_idle, new_idle, 1)
+
+          app.write_text(s, encoding='utf-8')
+          print('Automatic firmware replacement disabled; idle wakeword temporarily disabled for stability test')
           PY
 
       - name: Match current 16MB device partition layout
@@ -91,7 +105,7 @@ jobs:
       - name: Upload merged firmware
         uses: actions/upload-artifact@v4
         with:
-          name: mochi-poc1-${{ github.sha }}
+          name: mochi-poc12-${{ github.sha }}
           path: |
             build/merged-binary.bin
             build/partition_table/partition-table.bin
