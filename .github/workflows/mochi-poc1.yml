@@ -23,17 +23,38 @@ jobs:
         shell: bash
         run: python scripts/apply_mochi_poc1.py
 
-      - name: Normalize 1.83 board variant name
+      - name: Match current 16MB device partition layout
         shell: bash
         run: |
+          cat > partitions/v2/mochi_current_16m.csv <<'EOF'
+          # ESP-IDF Partition Table
+          # Name,   Type, SubType, Offset,  Size, Flags
+          nvs,      data, nvs,     0x9000,    0x4000,
+          otadata,  data, ota,     0xd000,    0x2000,
+          phy_init, data, phy,     0xf000,    0x1000,
+          ota_0,    app,  ota_0,   0x20000,   0x570000,
+          ota_1,    app,  ota_1,   0x590000,  0x570000,
+          assets,   data, spiffs,  0xB00000,  0x500000
+          EOF
+
           python - <<'PY'
           import json
           from pathlib import Path
           p = Path('main/boards/xingzhi-cube-1.83tft-wifi/config.json')
           data = json.loads(p.read_text(encoding='utf-8'))
-          data['builds'][0]['name'] = 'xingzhi-cube-1.83tft-wifi'
+          build = data['builds'][0]
+          build['name'] = 'xingzhi-cube-1.83tft-wifi'
+          opts = [x for x in build.get('sdkconfig_append', [])
+                  if not x.startswith('CONFIG_PARTITION_TABLE_CUSTOM_FILENAME=')
+                  and not x.startswith('CONFIG_ESPTOOLPY_FLASHSIZE_')]
+          opts += [
+              'CONFIG_ESPTOOLPY_FLASHSIZE_16MB=y',
+              'CONFIG_PARTITION_TABLE_CUSTOM=y',
+              'CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions/v2/mochi_current_16m.csv"',
+          ]
+          build['sdkconfig_append'] = opts
           p.write_text(json.dumps(data, ensure_ascii=False, indent=4) + '\n', encoding='utf-8')
-          print('Normalized build name to xingzhi-cube-1.83tft-wifi')
+          print('Using current-device layout: ota0 0x20000/0x570000, ota1 0x590000/0x570000, assets 0xB00000/0x500000')
           PY
 
       - name: Build target board
