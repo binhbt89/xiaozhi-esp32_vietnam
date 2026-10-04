@@ -11,7 +11,7 @@ permissions:
 
 jobs:
   build:
-    name: Build Mochi POC1.3 stable baseline for 1.83 TFT
+    name: Build Mochi POC1.4 final display QA for 1.83 TFT
     runs-on: ubuntu-latest
     container:
       image: espressif/idf:release-v5.5
@@ -19,15 +19,13 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Match tested panel transform and remove unstable wakeword path
+      - name: Apply final display QA board/runtime fixes
         shell: bash
         run: |
           python - <<'PY'
           from pathlib import Path
 
-          # IMPORTANT: POC1.3 deliberately does NOT apply the custom Mochi display
-          # subclass. POC0.3 assets remain on flash and provide Mochi/background.
-          # This build isolates the app/board layer first.
+          # Keep the orientation proven correct by POC1.3.
           cfg = Path('main/boards/xingzhi-cube-1.83tft-wifi/config.h')
           s = cfg.read_text(encoding='utf-8')
           repl = {
@@ -40,35 +38,45 @@ jobs:
                   raise SystemExit(f'orientation anchor not found: {old}')
               s = s.replace(old, new, 1)
           cfg.write_text(s, encoding='utf-8')
-          print('ST7789 transform: 284x240, swap_xy=true, mirror_x=false, mirror_y=true')
+
+          # ST7789 has 320-line GRAM while this glass exposes 284 pixels on the
+          # swapped axis. Apply the missing controller gap instead of moving LVGL.
+          board = Path('main/boards/xingzhi-cube-1.83tft-wifi/xingzhi-cube-1.83tft-wifi.cc')
+          s = board.read_text(encoding='utf-8')
+          anchor = '        ESP_ERROR_CHECK(esp_lcd_panel_init(panel_));\n'
+          insert = anchor + '        ESP_ERROR_CHECK(esp_lcd_panel_set_gap(panel_, 36, 0)); // Mochi POC1.4: physical ST7789 GRAM gap\n'
+          if anchor not in s:
+              raise SystemExit('panel init anchor not found')
+          s = s.replace(anchor, insert, 1)
+          board.write_text(s, encoding='utf-8')
 
           app = Path('main/application.cc')
           s = app.read_text(encoding='utf-8')
 
-          # Never let the public-source test build replace itself via OTA.
+          # Never let a public-source QA build overwrite itself by OTA.
           old = 'if (ota.HasNewVersion()) {'
-          new = 'if (false && ota.HasNewVersion()) { // Mochi POC: never auto-replace test firmware'
+          new = 'if (false && ota.HasNewVersion()) { // Mochi POC1.4 QA: no automatic firmware replacement'
           if old not in s:
               raise SystemExit('OTA upgrade anchor not found')
           s = s.replace(old, new, 1)
 
-          # The original vendor firmware and this public source do not necessarily
-          # use the same ESP-SR model/runtime. Keep wakeword fully off for this
-          # diagnostic baseline; the front button still starts normal listening.
+          # Keep wakeword completely off during this display/stability gate. The
+          # front button remains the only chat trigger, removing ESP-SR model
+          # compatibility as a confounding variable.
           old_idle = 'audio_service_.EnableVoiceProcessing(false);\n            audio_service_.EnableWakeWordDetection(true);'
-          new_idle = 'audio_service_.EnableVoiceProcessing(false);\n            audio_service_.EnableWakeWordDetection(false); // POC1.3 diagnostic: button-to-talk only'
+          new_idle = 'audio_service_.EnableVoiceProcessing(false);\n            audio_service_.EnableWakeWordDetection(false); // POC1.4 QA: button-to-talk only'
           if old_idle not in s:
               raise SystemExit('idle wakeword anchor not found')
           s = s.replace(old_idle, new_idle, 1)
 
           old_speaking = 'audio_service_.EnableWakeWordDetection(audio_service_.IsAfeWakeWord());'
-          new_speaking = 'audio_service_.EnableWakeWordDetection(false); // POC1.3 diagnostic: avoid incompatible wakeword runtime while speaking'
+          new_speaking = 'audio_service_.EnableWakeWordDetection(false); // POC1.4 QA: button-to-talk only'
           if old_speaking not in s:
               raise SystemExit('speaking wakeword anchor not found')
           s = s.replace(old_speaking, new_speaking, 1)
 
           app.write_text(s, encoding='utf-8')
-          print('OTA replacement off; wakeword off in idle/speaking; button-to-talk preserved')
+          print('POC1.4: orientation locked; physical panel gap=36,0; OTA/wakeword isolated')
           PY
 
       - name: Match current 16MB device partition layout
@@ -114,7 +122,7 @@ jobs:
       - name: Upload merged firmware
         uses: actions/upload-artifact@v4
         with:
-          name: mochi-poc13-${{ github.sha }}
+          name: mochi-poc14-${{ github.sha }}
           path: |
             build/merged-binary.bin
             build/partition_table/partition-table.bin
