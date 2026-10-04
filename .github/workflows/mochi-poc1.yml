@@ -11,7 +11,7 @@ permissions:
 
 jobs:
   build:
-    name: Build Mochi POC1 for 1.83 TFT
+    name: Build Mochi POC1.3 stable baseline for 1.83 TFT
     runs-on: ubuntu-latest
     container:
       image: espressif/idf:release-v5.5
@@ -19,21 +19,20 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Apply Mochi POC1 source overlay
-        shell: bash
-        run: python scripts/apply_mochi_poc1.py
-
-      - name: Match tested hardware orientation and stabilize idle mode
+      - name: Match tested panel transform and remove unstable wakeword path
         shell: bash
         run: |
           python - <<'PY'
           from pathlib import Path
 
+          # IMPORTANT: POC1.3 deliberately does NOT apply the custom Mochi display
+          # subclass. POC0.3 assets remain on flash and provide Mochi/background.
+          # This build isolates the app/board layer first.
           cfg = Path('main/boards/xingzhi-cube-1.83tft-wifi/config.h')
           s = cfg.read_text(encoding='utf-8')
           repl = {
               '#define DISPLAY_SWAP_XY  false': '#define DISPLAY_SWAP_XY  true',
-              '#define DISPLAY_MIRROR_X false': '#define DISPLAY_MIRROR_X true',
+              '#define DISPLAY_MIRROR_X false': '#define DISPLAY_MIRROR_X false',
               '#define DISPLAY_MIRROR_Y false': '#define DISPLAY_MIRROR_Y true',
           }
           for old, new in repl.items():
@@ -41,25 +40,35 @@ jobs:
                   raise SystemExit(f'orientation anchor not found: {old}')
               s = s.replace(old, new, 1)
           cfg.write_text(s, encoding='utf-8')
-          print('ST7789: swap XY + mirror X/Y to correct the observed 180-degree image')
+          print('ST7789 transform: 284x240, swap_xy=true, mirror_x=false, mirror_y=true')
 
           app = Path('main/application.cc')
           s = app.read_text(encoding='utf-8')
 
+          # Never let the public-source test build replace itself via OTA.
           old = 'if (ota.HasNewVersion()) {'
           new = 'if (false && ota.HasNewVersion()) { // Mochi POC: never auto-replace test firmware'
           if old not in s:
               raise SystemExit('OTA upgrade anchor not found')
           s = s.replace(old, new, 1)
 
+          # The original vendor firmware and this public source do not necessarily
+          # use the same ESP-SR model/runtime. Keep wakeword fully off for this
+          # diagnostic baseline; the front button still starts normal listening.
           old_idle = 'audio_service_.EnableVoiceProcessing(false);\n            audio_service_.EnableWakeWordDetection(true);'
-          new_idle = 'audio_service_.EnableVoiceProcessing(false);\n            audio_service_.EnableWakeWordDetection(false); // POC1.2: button-to-talk only; avoid idle wakeword reset/reconnect loop'
+          new_idle = 'audio_service_.EnableVoiceProcessing(false);\n            audio_service_.EnableWakeWordDetection(false); // POC1.3 diagnostic: button-to-talk only'
           if old_idle not in s:
               raise SystemExit('idle wakeword anchor not found')
           s = s.replace(old_idle, new_idle, 1)
 
+          old_speaking = 'audio_service_.EnableWakeWordDetection(audio_service_.IsAfeWakeWord());'
+          new_speaking = 'audio_service_.EnableWakeWordDetection(false); // POC1.3 diagnostic: avoid incompatible wakeword runtime while speaking'
+          if old_speaking not in s:
+              raise SystemExit('speaking wakeword anchor not found')
+          s = s.replace(old_speaking, new_speaking, 1)
+
           app.write_text(s, encoding='utf-8')
-          print('Automatic firmware replacement disabled; idle wakeword temporarily disabled for stability test')
+          print('OTA replacement off; wakeword off in idle/speaking; button-to-talk preserved')
           PY
 
       - name: Match current 16MB device partition layout
@@ -105,7 +114,7 @@ jobs:
       - name: Upload merged firmware
         uses: actions/upload-artifact@v4
         with:
-          name: mochi-poc12-${{ github.sha }}
+          name: mochi-poc13-${{ github.sha }}
           path: |
             build/merged-binary.bin
             build/partition_table/partition-table.bin
