@@ -1,6 +1,7 @@
 #include "wifi_board.h"
 #include "codecs/no_audio_codec.h"
 #include "display/lcd_display.h"
+#include "mochi_lcd_display.h"
 #ifdef CONFIG_SD_CARD_MMC_INTERFACE
 #include "sdmmc.h"
 #elif defined(CONFIG_SD_CARD_SPI_INTERFACE)
@@ -23,6 +24,7 @@
 #include <esp_sleep.h>
 
 #define TAG "XINGZHI_CUBE_1_54TFT_WIFI"
+#define MOCHI_BACKLIGHT_PERCENT 23
 
 class XINGZHI_CUBE_1_54TFT_WIFI : public WifiBoard {
 private:
@@ -58,14 +60,13 @@ private:
         });
         power_save_timer_->OnExitSleepMode([this]() {
             GetDisplay()->SetPowerSaveMode(false);
-            GetBacklight()->RestoreBrightness();
+            GetBacklight()->SetBrightness(MOCHI_BACKLIGHT_PERCENT, false);
         });
         power_save_timer_->OnShutdownRequest([this]() {
             ESP_LOGI(TAG, "Shutting down");
             rtc_gpio_set_level(GPIO_NUM_21, 0);
-            // 启用保持功能，确保睡眠期间电平不变
             rtc_gpio_hold_en(GPIO_NUM_21);
-            esp_lcd_panel_disp_on_off(panel_, false); //关闭显示
+            esp_lcd_panel_disp_on_off(panel_, false);
             esp_deep_sleep_start();
         });
         power_save_timer_->SetEnabled(true);
@@ -155,8 +156,8 @@ private:
         ESP_ERROR_CHECK(esp_lcd_panel_mirror(panel_, DISPLAY_MIRROR_X, DISPLAY_MIRROR_Y));
         ESP_ERROR_CHECK(esp_lcd_panel_invert_color(panel_, true));
 
-        display_ = new SpiLcdDisplay(panel_io_, panel_, DISPLAY_WIDTH, DISPLAY_HEIGHT, DISPLAY_OFFSET_X, DISPLAY_OFFSET_Y, 
-            DISPLAY_MIRROR_X, DISPLAY_MIRROR_Y, DISPLAY_SWAP_XY);
+        display_ = new MochiSpiLcdDisplay(panel_io_, panel_, DISPLAY_WIDTH, DISPLAY_HEIGHT,
+            DISPLAY_OFFSET_X, DISPLAY_OFFSET_Y, DISPLAY_MIRROR_X, DISPLAY_MIRROR_Y, DISPLAY_SWAP_XY);
     }
 
 public:
@@ -169,19 +170,20 @@ public:
         InitializeSpi();
         InitializeButtons();
         InitializeSt7789Display();
-        GetBacklight()->RestoreBrightness();
+        GetBacklight()->SetBrightness(MOCHI_BACKLIGHT_PERCENT, false);
     }
 
     virtual AudioCodec* GetAudioCodec() override {
         static NoAudioCodecSimplex audio_codec(AUDIO_INPUT_SAMPLE_RATE, AUDIO_OUTPUT_SAMPLE_RATE,
-            AUDIO_I2S_SPK_GPIO_BCLK, AUDIO_I2S_SPK_GPIO_LRCK, AUDIO_I2S_SPK_GPIO_DOUT, AUDIO_I2S_MIC_GPIO_SCK, AUDIO_I2S_MIC_GPIO_WS, AUDIO_I2S_MIC_GPIO_DIN);
+            AUDIO_I2S_SPK_GPIO_BCLK, AUDIO_I2S_SPK_GPIO_LRCK, AUDIO_I2S_SPK_GPIO_DOUT,
+            AUDIO_I2S_MIC_GPIO_SCK, AUDIO_I2S_MIC_GPIO_WS, AUDIO_I2S_MIC_GPIO_DIN);
         return &audio_codec;
     }
 
     virtual Display* GetDisplay() override {
         return display_;
     }
-    
+
     virtual Backlight* GetBacklight() override {
         static PwmBacklight backlight(DISPLAY_BACKLIGHT_PIN, DISPLAY_BACKLIGHT_OUTPUT_INVERT);
         return &backlight;
@@ -220,7 +222,7 @@ public:
         if (CARD_SDMMC_D3_GPIO != GPIO_NUM_NC) {
             gpio_set_direction(CARD_SDMMC_D3_GPIO, GPIO_MODE_INPUT);
             gpio_pullup_en(CARD_SDMMC_D3_GPIO);
-            vTaskDelay(pdMS_TO_TICKS(10)); // Wait for the pin to stabilize
+            vTaskDelay(pdMS_TO_TICKS(10));
         }
 #endif
         static SdMMC sdmmc(CARD_SDMMC_CLK_GPIO,
