@@ -24,7 +24,7 @@
 #include <esp_sleep.h>
 
 #define TAG "XINGZHI_CUBE_1_54TFT_WIFI"
-#define MOCHI_BACKLIGHT_PERCENT 23
+#define MOCHI_BACKLIGHT_PERCENT 25
 
 class XINGZHI_CUBE_1_54TFT_WIFI : public WifiBoard {
 private:
