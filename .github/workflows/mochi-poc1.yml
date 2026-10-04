@@ -1,0 +1,40 @@
+name: Mochi POC1
+
+on:
+  push:
+    branches:
+      - ci/mochi-poc1
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build Mochi POC1 for 1.83 TFT
+    runs-on: ubuntu-latest
+    container:
+      image: espressif/idf:release-v5.5
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Apply Mochi POC1 source overlay
+        shell: bash
+        run: python scripts/apply_mochi_poc1.py
+
+      - name: Build target board
+        shell: bash
+        run: |
+          source $IDF_PATH/export.sh
+          python scripts/release.py xingzhi-cube-1.83tft-wifi --name xingzhi-cube-1.54tft-wifi
+
+      - name: Upload merged firmware
+        uses: actions/upload-artifact@v4
+        with:
+          name: mochi-poc1-${{ github.sha }}
+          path: |
+            build/merged-binary.bin
+            build/partition_table/partition-table.bin
+            releases/*.zip
+          if-no-files-found: error
