@@ -48,14 +48,18 @@
 #define DISPLAY_DC GPIO_NUM_8
 #define DISPLAY_CS GPIO_NUM_14
 #define DISPLAY_RES GPIO_NUM_18
-#define DISPLAY_WIDTH   284
-#define DISPLAY_HEIGHT  240
-#define DISPLAY_SWAP_XY  false
+
+// Correct 1.83-inch ST7789 geometry used by the board.
+// The controller is 240x320 internally; the active 284x240 landscape window
+// needs the 36-pixel X RAM offset after XY swap.
+#define DISPLAY_WIDTH    284
+#define DISPLAY_HEIGHT   240
+#define DISPLAY_SWAP_XY  true
 #define DISPLAY_MIRROR_X false
-#define DISPLAY_MIRROR_Y false
+#define DISPLAY_MIRROR_Y true
 #define BACKLIGHT_INVERT false
-#define DISPLAY_OFFSET_X  0
-#define DISPLAY_OFFSET_Y  0
+#define DISPLAY_OFFSET_X 36
+#define DISPLAY_OFFSET_Y 0
 #define DISPLAY_BACKLIGHT_PIN GPIO_NUM_13
 #define DISPLAY_BACKLIGHT_OUTPUT_INVERT false
 
