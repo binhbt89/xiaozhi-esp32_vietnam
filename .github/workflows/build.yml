@@ -1,16 +1,16 @@
-name: Build Mochi Xingzhi Test
+name: Build Mochi Xingzhi 284x240 Fix
 
 on:
   push:
     branches:
-      - ci/mochi-ui-test
+      - ci/mochi-183-fix
 
 permissions:
   contents: read
 
 jobs:
   build:
-    name: Build xingzhi-cube-1.54tft-wifi
+    name: Build Mochi 284x240
     runs-on: ubuntu-latest
     container:
       image: espressif/idf:release-v5.5
@@ -18,7 +18,7 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Build Mochi Xingzhi Wi-Fi
+      - name: Build Mochi Xingzhi 284x240
         shell: bash
         run: |
           source $IDF_PATH/export.sh
@@ -27,7 +27,7 @@ jobs:
       - name: Upload firmware artifact
         uses: actions/upload-artifact@v4
         with:
-          name: mochi_xingzhi_1_54tft_wifi_${{ github.sha }}
+          name: mochi_xingzhi_284x240_${{ github.sha }}
           path: build/merged-binary.bin
           if-no-files-found: error
           retention-days: 30
