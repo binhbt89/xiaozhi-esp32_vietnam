@@ -4,10 +4,9 @@
 #include <lvgl.h>
 #include <cstring>
 
-// Minimal Mochi UI layer for the 1.83-inch board.
-// Important: keep the original LVGL parent/layout for emoji_box_. Moving it to
-// the screen root breaks the base display layout and can push the GIF outside
-// the controller's active window. We only apply a visual translation.
+// Mochi UI layer for the real 1.83-inch ST7789 board.
+// Keep the base LVGL parent/flex layout intact: re-parenting emoji_box_ was the
+// source of the previous missing/cropped pet regression. Only translate it.
 class Mochi183LcdDisplay : public SpiLcdDisplay {
 private:
     lv_obj_t* mochi_chat_bubble_ = nullptr;
@@ -20,14 +19,21 @@ private:
 
         lv_obj_t* screen = lv_screen_active();
 
-        // Keep GIF dimensions, decoder, parent and flex layout untouched.
-        // Translate only the rendered object down so Mochi sits near the floor.
+        // The stock empty chat label still participates in the vertical flex
+        // layout. Hide it because replies use our overlay bubble instead.
+        if (chat_message_label_ != nullptr) {
+            lv_obj_add_flag(chat_message_label_, LV_OBJ_FLAG_HIDDEN);
+        }
+
+        // Keep GIF dimensions, decoder and parent untouched. With the old chat
+        // label hidden, the pet is centered by the stock layout; +50 px puts an
+        // 80-96 px Mochi safely near the bottom without clipping.
         if (emoji_box_ != nullptr) {
-            lv_obj_set_style_translate_y(emoji_box_, 38, 0);
+            lv_obj_set_style_translate_y(emoji_box_, 50, 0);
             lv_obj_move_foreground(emoji_box_);
         }
 
-        // Independent translucent response bubble at the top.
+        // Independent translucent assistant-response bubble near the top.
         mochi_chat_bubble_ = lv_obj_create(screen);
         lv_obj_set_width(mochi_chat_bubble_, 236);
         lv_obj_set_height(mochi_chat_bubble_, LV_SIZE_CONTENT);
@@ -81,10 +87,11 @@ public:
             return;
         }
 
-        // User speech is already obvious from the listening state; reserve the
-        // bubble for system/assistant responses so it does not cover Mochi.
-        const bool is_user = (role != nullptr && std::strcmp(role, "user") == 0);
-        if (is_user || content == nullptr || content[0] == '\0') {
+        // Only spoken assistant replies use this bubble. User/system/status text
+        // stays out of the scene, preventing startup/status messages from
+        // covering Mochi or the room background.
+        const bool is_assistant = (role != nullptr && std::strcmp(role, "assistant") == 0);
+        if (!is_assistant || content == nullptr || content[0] == '\0') {
             lv_label_set_text(mochi_chat_label_, "");
             lv_obj_add_flag(mochi_chat_bubble_, LV_OBJ_FLAG_HIDDEN);
         } else {
