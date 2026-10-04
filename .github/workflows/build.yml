@@ -1,9 +1,9 @@
-name: Build Mochi Xingzhi Test
+name: Build Mochi Stable UI 06
 
 on:
   push:
     branches:
-      - ci/mochi-ui-test
+      - mochi-ui-stable-06
 
 permissions:
   contents: read
@@ -27,7 +27,7 @@ jobs:
       - name: Upload firmware artifact
         uses: actions/upload-artifact@v4
         with:
-          name: mochi_xingzhi_1_54tft_wifi_${{ github.sha }}
+          name: mochi_stable_ui_06_${{ github.sha }}
           path: build/merged-binary.bin
           if-no-files-found: error
           retention-days: 30
