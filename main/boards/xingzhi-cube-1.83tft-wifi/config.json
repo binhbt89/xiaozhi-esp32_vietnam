@@ -4,6 +4,9 @@
         {
             "name": "xingzhi-cube-1.83tft-wifi",
             "sdkconfig_append": [
+                "CONFIG_PARTITION_TABLE_CUSTOM=y",
+                "CONFIG_PARTITION_TABLE_CUSTOM_FILENAME=\"partitions/mochi_factory_16m.csv\"",
+                "CONFIG_PARTITION_TABLE_FILENAME=\"partitions/mochi_factory_16m.csv\"",
                 "CONFIG_SD_CARD_SPI_INTERFACE=n",
                 "CONFIG_FATFS_LFN_HEAP=y",
                 "CONFIG_FATFS_API_ENCODING_UTF_8=y",
