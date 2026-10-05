@@ -1,16 +1,16 @@
-name: Build Mochi Ambient Safe LVGL 13
+name: Build Mochi Animation Light Fix 14
 
 on:
   push:
     branches:
-      - mochi-ambient-safe-lvgl-13
+      - mochi-animation-light-fix-14
 
 permissions:
   contents: read
 
 jobs:
   build:
-    name: Build Mochi ambient safe LVGL 13
+    name: Build Mochi animation light Fix14
     runs-on: ubuntu-latest
     container:
       image: espressif/idf:v5.5.1
@@ -77,20 +77,18 @@ jobs:
           grep -n "app.GetDeviceState() == kDeviceStateSpeaking" main/boards/xingzhi-cube-1.83tft-wifi/xingzhi-cube-1.83tft-wifi.cc
           grep -n "app.SetDeviceState(kDeviceStateListening)" main/boards/xingzhi-cube-1.83tft-wifi/xingzhi-cube-1.83tft-wifi.cc
 
-      - name: Verify ambient safe LVGL code
+      - name: Verify Fix14 animation and lighting code
         shell: bash
         run: |
           H=main/boards/xingzhi-cube-1.83tft-wifi/mochi_lcd_display.h
-          grep -n "lv_timer_create" "$H"
-          grep -n "container_, active_background_" "$H"
-          grep -n "idle_stable_ticks_ < 5" "$H"
-          grep -n "SNTP fallback started" "$H"
+          grep -n "kAmbientTimerMs = 200" "$H"
+          grep -n "kMoveStepPx = 5" "$H"
+          grep -n "positions\[\] = {-50, -25, 0, 25, 50}" "$H"
+          grep -n "lv_obj_set_size(night_glow_, 54, 54)" "$H"
+          grep -n "std::clamp(42 + pulse" "$H"
+          grep -n "kIdleSettleTicks" "$H"
           if grep -n "xTaskCreatePinnedToCore" "$H"; then
             echo "Unexpected dedicated ambient FreeRTOS task remains"
-            exit 1
-          fi
-          if grep -n "lv_obj_set_style_bg_image_src(screen" "$H"; then
-            echo "Unexpected screen background switch remains"
             exit 1
           fi
 
@@ -106,7 +104,7 @@ jobs:
       - name: Upload firmware and debug symbols
         uses: actions/upload-artifact@v4
         with:
-          name: mochi_ambient_safe_lvgl13_${{ github.sha }}
+          name: mochi_animation_light_fix14_${{ github.sha }}
           path: |
             build/merged-binary.bin
             build/**/*.elf
