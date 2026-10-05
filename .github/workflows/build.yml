@@ -1,16 +1,16 @@
-name: Build Mochi Stability Fix 08
+name: Build Mochi Interrupt Fix 09
 
 on:
   push:
     branches:
-      - mochi-stability-fix-08
+      - mochi-interrupt-fix-09
 
 permissions:
   contents: read
 
 jobs:
   build:
-    name: Build Mochi stability fix 08
+    name: Build Mochi interrupt fix 09
     runs-on: ubuntu-latest
     container:
       image: espressif/idf:v5.5.1
@@ -84,6 +84,12 @@ jobs:
           grep -nE 'audio_input"|audio_output"|opus_codec"' main/audio/audio_service.cc
           grep -n 'audio_detection"' main/audio/wake_words/afe_wake_word.cc
 
+      - name: Verify talk-button barge-in patch
+        shell: bash
+        run: |
+          grep -n "app.GetDeviceState() == kDeviceStateSpeaking" main/boards/xingzhi-cube-1.83tft-wifi/xingzhi-cube-1.83tft-wifi.cc
+          grep -n "app.SetDeviceState(kDeviceStateListening)" main/boards/xingzhi-cube-1.83tft-wifi/xingzhi-cube-1.83tft-wifi.cc
+
       - name: Build corrected 1.83 firmware
         shell: bash
         run: |
@@ -96,7 +102,7 @@ jobs:
       - name: Upload firmware and debug symbols
         uses: actions/upload-artifact@v4
         with:
-          name: mochi_stability_fix08_${{ github.sha }}
+          name: mochi_interrupt_fix09_${{ github.sha }}
           path: |
             build/merged-binary.bin
             build/**/*.elf
