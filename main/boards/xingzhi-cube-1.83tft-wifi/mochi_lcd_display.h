@@ -29,8 +29,12 @@ private:
     };
 
     static constexpr const char* kAmbientTag = "MochiAmbient";
-    static constexpr time_t kValidEpochThreshold = 1704067200; // 2024-01-01 UTC
+    static constexpr time_t kValidEpochThreshold = 1704067200;
     static constexpr int kVietnamUtcOffsetSeconds = 7 * 60 * 60;
+    static constexpr uint32_t kAmbientTimerMs = 200;
+    static constexpr uint32_t kIdleSettleTicks = 25;          // 5 seconds
+    static constexpr uint32_t kBackgroundReapplyTicks = 300; // 60 seconds
+    static constexpr int kMoveStepPx = 5;
 
     lv_obj_t* mochi_chat_bubble_ = nullptr;
     lv_obj_t* mochi_chat_label_ = nullptr;
@@ -76,14 +80,10 @@ private:
             return;
         }
 
-        // Never do network setup from the LVGL timer callback. Queue it onto
-        // the normal application event loop and let the LVGL timer simply wait
-        // until time() becomes valid.
         Application::GetInstance().Schedule([this]() {
             if (ambient_sntp_started_.load()) {
                 return;
             }
-
             esp_sntp_setoperatingmode(SNTP_OPMODE_POLL);
             esp_sntp_setservername(0, "pool.ntp.org");
             esp_sntp_init();
@@ -99,10 +99,6 @@ private:
             return AmbientPeriod::Unknown;
         }
 
-        // The existing OTA path writes server_time after applying the returned
-        // timezone_offset, so gmtime_r(now) is already local time there.
-        // Our SNTP fallback stores UTC, therefore add UTC+7 only when fallback
-        // was actually started by this class.
         time_t scene_time = now;
         const bool using_sntp = ambient_sntp_started_.load();
         if (using_sntp) {
@@ -119,15 +115,9 @@ private:
                      hour, using_sntp ? "SNTP+UTC7" : "server_time");
         }
 
-        if (hour >= 5 && hour < 11) {
-            return AmbientPeriod::Morning;
-        }
-        if (hour >= 11 && hour < 15) {
-            return AmbientPeriod::Noon;
-        }
-        if (hour >= 15 && hour < 18) {
-            return AmbientPeriod::Afternoon;
-        }
+        if (hour >= 5 && hour < 11) return AmbientPeriod::Morning;
+        if (hour >= 11 && hour < 15) return AmbientPeriod::Noon;
+        if (hour >= 15 && hour < 18) return AmbientPeriod::Afternoon;
         return AmbientPeriod::Night;
     }
 
@@ -149,56 +139,48 @@ private:
             return false;
         }
 
-        // Create only the one image descriptor we actually need. Do this from
-        // LVGL's own timer context, then switch the SAME object that the stock
-        // theme uses (container_). The old implementation changed the screen
-        // background while the opaque container still displayed background_day,
-        // so the user could never see the selected scene.
         auto next = std::make_shared<LvglCBinImage>(ptr);
         if (next == nullptr || next->image_dsc() == nullptr) {
             ESP_LOGE(kAmbientTag, "Failed to create background descriptor: %s", name);
             return false;
         }
 
-        auto previous = active_background_; // keep old descriptor alive until switch completes
+        auto previous = active_background_;
         active_background_ = next;
         lv_obj_set_style_bg_image_src(container_, active_background_->image_dsc(), 0);
         lv_obj_set_style_bg_image_opa(container_, LV_OPA_COVER, 0);
         lv_obj_invalidate(container_);
-
         ESP_LOGI(kAmbientTag, "Applied background: %s", name);
         return true;
     }
 
     void CreateAmbientObjects(lv_obj_t* screen) {
-        // These are deliberately tiny translucent overlays. They are children
-        // of the screen, created once, and only their position/opacity changes.
         sun_patch_ = lv_obj_create(screen);
         lv_obj_remove_style_all(sun_patch_);
-        lv_obj_set_size(sun_patch_, 68, 38);
-        lv_obj_set_style_radius(sun_patch_, 6, 0);
+        lv_obj_set_size(sun_patch_, 74, 42);
+        lv_obj_set_style_radius(sun_patch_, 8, 0);
         lv_obj_set_style_bg_color(sun_patch_, lv_color_hex(0xFFF0A8), 0);
-        lv_obj_set_style_bg_opa(sun_patch_, static_cast<lv_opa_t>(22), 0);
+        lv_obj_set_style_bg_opa(sun_patch_, static_cast<lv_opa_t>(28), 0);
         lv_obj_clear_flag(sun_patch_, LV_OBJ_FLAG_SCROLLABLE);
         lv_obj_clear_flag(sun_patch_, LV_OBJ_FLAG_CLICKABLE);
         lv_obj_add_flag(sun_patch_, LV_OBJ_FLAG_HIDDEN);
 
         night_glow_ = lv_obj_create(screen);
         lv_obj_remove_style_all(night_glow_);
-        lv_obj_set_size(night_glow_, 34, 34);
-        lv_obj_set_style_radius(night_glow_, 17, 0);
+        lv_obj_set_size(night_glow_, 54, 54);
+        lv_obj_set_style_radius(night_glow_, 27, 0);
         lv_obj_set_style_bg_color(night_glow_, lv_color_hex(0xFFB45E), 0);
-        lv_obj_set_style_bg_opa(night_glow_, static_cast<lv_opa_t>(30), 0);
+        lv_obj_set_style_bg_opa(night_glow_, static_cast<lv_opa_t>(48), 0);
         lv_obj_clear_flag(night_glow_, LV_OBJ_FLAG_SCROLLABLE);
         lv_obj_clear_flag(night_glow_, LV_OBJ_FLAG_CLICKABLE);
         lv_obj_add_flag(night_glow_, LV_OBJ_FLAG_HIDDEN);
 
         night_floor_glow_ = lv_obj_create(screen);
         lv_obj_remove_style_all(night_floor_glow_);
-        lv_obj_set_size(night_floor_glow_, 48, 18);
-        lv_obj_set_style_radius(night_floor_glow_, 8, 0);
+        lv_obj_set_size(night_floor_glow_, 82, 30);
+        lv_obj_set_style_radius(night_floor_glow_, 15, 0);
         lv_obj_set_style_bg_color(night_floor_glow_, lv_color_hex(0xFFCA78), 0);
-        lv_obj_set_style_bg_opa(night_floor_glow_, static_cast<lv_opa_t>(16), 0);
+        lv_obj_set_style_bg_opa(night_floor_glow_, static_cast<lv_opa_t>(28), 0);
         lv_obj_clear_flag(night_floor_glow_, LV_OBJ_FLAG_SCROLLABLE);
         lv_obj_clear_flag(night_floor_glow_, LV_OBJ_FLAG_CLICKABLE);
         lv_obj_add_flag(night_floor_glow_, LV_OBJ_FLAG_HIDDEN);
@@ -253,7 +235,8 @@ private:
     void StartAmbientLvglTimer() {
         if (!Lock(1000)) return;
         if (ambient_timer_ == nullptr) {
-            ambient_timer_ = lv_timer_create(&Mochi183LcdDisplay::AmbientLvglTimerThunk, 1000, this);
+            ambient_timer_ = lv_timer_create(&Mochi183LcdDisplay::AmbientLvglTimerThunk,
+                                             kAmbientTimerMs, this);
         }
         Unlock();
     }
@@ -271,11 +254,11 @@ private:
     void ChooseNextIdleActionLvgl() {
         const uint32_t roll = esp_random() % 100;
 
-        if (roll < 46) {
-            const int positions[] = {-34, -18, 0, 18, 34};
+        if (roll < 52) {
+            const int positions[] = {-50, -25, 0, 25, 50};
             mochi_target_x_ = positions[esp_random() % 5];
             if (mochi_target_x_ == mochi_x_) {
-                mochi_target_x_ = (mochi_x_ <= 0) ? 28 : -28;
+                mochi_target_x_ = (mochi_x_ <= 0) ? 50 : -50;
             }
 
             if (mochi_target_x_ < mochi_x_) {
@@ -285,31 +268,28 @@ private:
             }
 
             int distance = std::abs(mochi_target_x_ - mochi_x_);
-            action_ticks_left_ = std::max(5, distance / 4 + 2);
-        } else if (roll < 62) {
+            action_ticks_left_ = std::max(2, (distance + kMoveStepPx - 1) / kMoveStepPx);
+        } else if (roll < 70) {
             QueueAmbientEmotion("ambient_sit");
-            action_ticks_left_ = 5 + static_cast<int>(esp_random() % 5);
-        } else if (roll < 74) {
-            QueueAmbientEmotion("ambient_groom");
-            action_ticks_left_ = 5 + static_cast<int>(esp_random() % 4);
-        } else if (roll < 84) {
+            action_ticks_left_ = 20 + static_cast<int>(esp_random() % 16); // 4.0-7.0s
+        } else if (roll < 82) {
             QueueAmbientEmotion("ambient_lie");
-            action_ticks_left_ = 7 + static_cast<int>(esp_random() % 5);
-        } else if (roll < 92) {
+            action_ticks_left_ = 25 + static_cast<int>(esp_random() % 16); // 5.0-8.0s
+        } else if (roll < 90) {
             QueueAmbientEmotion("ambient_sleep");
-            action_ticks_left_ = 10 + static_cast<int>(esp_random() % 7);
+            action_ticks_left_ = 40 + static_cast<int>(esp_random() % 21); // 8.0-12.0s
         } else {
             QueueAmbientEmotion("ambient_idle");
             mochi_target_x_ = mochi_x_;
-            action_ticks_left_ = 5 + static_cast<int>(esp_random() % 5);
+            action_ticks_left_ = 10 + static_cast<int>(esp_random() % 16); // 2.0-5.0s
         }
     }
 
     void StepMochiPositionLvgl() {
         if (mochi_x_ < mochi_target_x_) {
-            mochi_x_ = std::min(mochi_x_ + 4, mochi_target_x_);
+            mochi_x_ = std::min(mochi_x_ + kMoveStepPx, mochi_target_x_);
         } else if (mochi_x_ > mochi_target_x_) {
-            mochi_x_ = std::max(mochi_x_ - 4, mochi_target_x_);
+            mochi_x_ = std::max(mochi_x_ - kMoveStepPx, mochi_target_x_);
         }
 
         if (emoji_box_ != nullptr) {
@@ -323,40 +303,50 @@ private:
         if (period == AmbientPeriod::Noon || period == AmbientPeriod::Afternoon) {
             if (sun_patch_ != nullptr) {
                 lv_obj_remove_flag(sun_patch_, LV_OBJ_FLAG_HIDDEN);
-                int phase = static_cast<int>(ambient_phase_ % 120);
-                int walk = phase <= 60 ? phase : (120 - phase);
-                int x = 92 + walk;
-                int y = (period == AmbientPeriod::Noon) ? 137 : 146;
-                int flicker = static_cast<int>(esp_random() % 5);
-                lv_obj_set_pos(sun_patch_, x, y + (flicker & 1));
+
+                const int travel_phase = static_cast<int>(ambient_phase_ % 400);
+                const int travel = travel_phase <= 200 ? travel_phase : (400 - travel_phase);
+                const int x = 55 + travel / 2; // 55..155, slow ~80s sweep
+                const int y = (period == AmbientPeriod::Noon) ? 136 : 146;
+
+                const int shimmer_phase = static_cast<int>(ambient_phase_ % 40);
+                const int shimmer = shimmer_phase <= 20 ? shimmer_phase : (40 - shimmer_phase);
+                const int opacity = (period == AmbientPeriod::Noon ? 25 : 21) + shimmer / 2;
+
+                lv_obj_set_pos(sun_patch_, x, y);
                 lv_obj_set_style_bg_color(
                     sun_patch_,
                     period == AmbientPeriod::Noon ? lv_color_hex(0xFFF0A8)
                                                   : lv_color_hex(0xFFCB78),
                     0);
-                lv_obj_set_style_bg_opa(
-                    sun_patch_,
-                    static_cast<lv_opa_t>((period == AmbientPeriod::Noon ? 18 : 14) + flicker),
-                    0);
+                lv_obj_set_style_bg_opa(sun_patch_, static_cast<lv_opa_t>(opacity), 0);
             }
             if (night_glow_ != nullptr) lv_obj_add_flag(night_glow_, LV_OBJ_FLAG_HIDDEN);
             if (night_floor_glow_ != nullptr) lv_obj_add_flag(night_floor_glow_, LV_OBJ_FLAG_HIDDEN);
         } else if (period == AmbientPeriod::Night) {
             if (sun_patch_ != nullptr) lv_obj_add_flag(sun_patch_, LV_OBJ_FLAG_HIDDEN);
 
-            int jitter_x = static_cast<int>(esp_random() % 3) - 1;
-            int jitter_y = static_cast<int>(esp_random() % 3) - 1;
+            // Slow candle/lamp breathing: visible but not a harsh strobe.
+            const int pulse_phase = static_cast<int>(ambient_phase_ % 50);
+            const int pulse = pulse_phase <= 25 ? pulse_phase : (50 - pulse_phase); // 0..25
+            const int slow_step = static_cast<int>((ambient_phase_ / 4) % 3) - 1;
+            const int tiny_flicker = static_cast<int>(esp_random() % 5) - 2;
+
             if (night_glow_ != nullptr) {
                 lv_obj_remove_flag(night_glow_, LV_OBJ_FLAG_HIDDEN);
-                lv_obj_set_pos(night_glow_, 204 + jitter_x, 63 + jitter_y);
+                lv_obj_set_pos(night_glow_, 196 + slow_step, 54 - slow_step);
                 lv_obj_set_style_bg_opa(
-                    night_glow_, static_cast<lv_opa_t>(24 + static_cast<int>(esp_random() % 14)), 0);
+                    night_glow_,
+                    static_cast<lv_opa_t>(std::clamp(42 + pulse + tiny_flicker, 38, 70)),
+                    0);
             }
             if (night_floor_glow_ != nullptr) {
                 lv_obj_remove_flag(night_floor_glow_, LV_OBJ_FLAG_HIDDEN);
-                lv_obj_set_pos(night_floor_glow_, 185 - jitter_x, 108 + jitter_y);
+                lv_obj_set_pos(night_floor_glow_, 166 - slow_step, 110 + slow_step);
                 lv_obj_set_style_bg_opa(
-                    night_floor_glow_, static_cast<lv_opa_t>(12 + static_cast<int>(esp_random() % 10)), 0);
+                    night_floor_glow_,
+                    static_cast<lv_opa_t>(std::clamp(24 + pulse / 2 + tiny_flicker, 20, 40)),
+                    0);
             }
         } else {
             if (sun_patch_ != nullptr) lv_obj_add_flag(sun_patch_, LV_OBJ_FLAG_HIDDEN);
@@ -366,11 +356,9 @@ private:
     }
 
     void AmbientTickLvgl() {
-        // All decorative LVGL writes in Fix13 happen here, inside LVGL's own
-        // timer handler. No FreeRTOS/esp_timer task touches LVGL objects.
         if (Application::GetInstance().GetDeviceState() != kDeviceStateIdle) {
             idle_stable_ticks_ = 0;
-            action_ticks_left_ = 2;
+            action_ticks_left_ = 8;
             return;
         }
 
@@ -379,9 +367,7 @@ private:
             return;
         }
 
-        // Let the normal boot/network/assets pipeline settle for five full idle
-        // seconds before loading or switching any background descriptor.
-        if (idle_stable_ticks_ < 5) {
+        if (idle_stable_ticks_ < kIdleSettleTicks) {
             ++idle_stable_ticks_;
             return;
         }
@@ -391,7 +377,7 @@ private:
             return;
         }
 
-        bool need_background = (period != ambient_period_) || (active_background_ == nullptr);
+        const bool need_background = (period != ambient_period_) || (active_background_ == nullptr);
         if (need_background) {
             if (!LoadAndApplyBackgroundLvgl(period)) {
                 return;
@@ -400,9 +386,8 @@ private:
             background_reapply_ticks_ = 0;
         } else {
             ++background_reapply_ticks_;
-            // Re-assert the selected image once a minute in case a theme refresh
-            // replaced container_'s background. No descriptor recreation needed.
-            if (background_reapply_ticks_ >= 60 && active_background_ != nullptr && container_ != nullptr) {
+            if (background_reapply_ticks_ >= kBackgroundReapplyTicks &&
+                active_background_ != nullptr && container_ != nullptr) {
                 background_reapply_ticks_ = 0;
                 lv_obj_set_style_bg_image_src(container_, active_background_->image_dsc(), 0);
                 lv_obj_set_style_bg_image_opa(container_, LV_OPA_COVER, 0);
