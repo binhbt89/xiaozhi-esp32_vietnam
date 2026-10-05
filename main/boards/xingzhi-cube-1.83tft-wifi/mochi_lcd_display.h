@@ -6,8 +6,11 @@
 #include "assets.h"
 
 #include <lvgl.h>
-#include <esp_timer.h>
 #include <esp_random.h>
+#include <esp_log.h>
+#include <esp_sntp.h>
+#include <freertos/FreeRTOS.h>
+#include <freertos/task.h>
 
 #include <algorithm>
 #include <cstring>
@@ -25,13 +28,17 @@ private:
         Night
     };
 
+    static constexpr const char* kAmbientTag = "MochiAmbient";
+    static constexpr time_t kValidEpochThreshold = 1704067200; // 2024-01-01 UTC
+    static constexpr int kVietnamUtcOffsetSeconds = 7 * 60 * 60;
+
     lv_obj_t* mochi_chat_bubble_ = nullptr;
     lv_obj_t* mochi_chat_label_ = nullptr;
     lv_obj_t* sun_patch_ = nullptr;
     lv_obj_t* night_glow_ = nullptr;
     lv_obj_t* night_floor_glow_ = nullptr;
 
-    esp_timer_handle_t ambient_timer_ = nullptr;
+    TaskHandle_t ambient_task_ = nullptr;
 
     std::shared_ptr<LvglCBinImage> bg_morning_;
     std::shared_ptr<LvglCBinImage> bg_noon_;
@@ -40,17 +47,31 @@ private:
     bool ambient_backgrounds_loaded_ = false;
 
     AmbientPeriod ambient_period_ = AmbientPeriod::Unknown;
-    int ambient_boot_grace_ = 18;
     uint32_t ambient_phase_ = 0;
 
     int mochi_x_ = 0;
     int mochi_target_x_ = 0;
     int action_ticks_left_ = 0;
 
-    static void AmbientTimerThunk(void* arg) {
+    bool ambient_sntp_started_ = false;
+    bool ambient_sntp_stopped_ = false;
+    int last_logged_hour_ = -1;
+
+    static void AmbientTaskThunk(void* arg) {
         auto* self = static_cast<Mochi183LcdDisplay*>(arg);
         if (self != nullptr) {
-            self->AmbientTick();
+            self->AmbientTaskLoop();
+        }
+        vTaskDelete(nullptr);
+    }
+
+    void AmbientTaskLoop() {
+        // Do not touch Assets/LVGL during the early boot path. The previous
+        // esp_timer callback could wake while assets/network startup was busy.
+        vTaskDelay(pdMS_TO_TICKS(2500));
+        while (true) {
+            AmbientTick();
+            vTaskDelay(pdMS_TO_TICKS(1000));
         }
     }
 
@@ -160,18 +181,61 @@ private:
         ok &= LoadCbinBackground("background_afternoon.raw", bg_afternoon_);
         ok &= LoadCbinBackground("background_night.raw", bg_night_);
         ambient_backgrounds_loaded_ = ok;
+
+        if (!ok) {
+            ESP_LOGW(kAmbientTag, "Ambient backgrounds not ready yet");
+        }
+    }
+
+    bool IsClockValid(time_t now) const {
+        return now >= kValidEpochThreshold;
+    }
+
+    void StartSntpFallback() {
+        if (ambient_sntp_started_) {
+            return;
+        }
+
+        // OTA normally supplies server_time. If that request fails (for example
+        // weak Wi-Fi/TLS), ESP32 boots without a valid wall clock. Use SNTP only
+        // as a fallback for the ambient scene clock.
+        esp_sntp_setoperatingmode(SNTP_OPMODE_POLL);
+        esp_sntp_setservername(0, "pool.ntp.org");
+        esp_sntp_init();
+        ambient_sntp_started_ = true;
+        ESP_LOGW(kAmbientTag, "System clock invalid; started SNTP fallback");
     }
 
     AmbientPeriod GetAmbientPeriod() {
         time_t now = time(nullptr);
-        struct tm tm_now {};
-        gmtime_r(&now, &tm_now);
-
-        if (tm_now.tm_year < (2024 - 1900)) {
-            return AmbientPeriod::Noon;
+        if (!IsClockValid(now)) {
+            StartSntpFallback();
+            return AmbientPeriod::Unknown;
         }
 
+        // Existing OTA code stores server_time after applying timezone_offset,
+        // so gmtime_r() already returns Vietnam local time in that path.
+        // SNTP fallback provides real UTC; add UTC+7 only in the fallback path.
+        time_t scene_time = now;
+        if (ambient_sntp_started_) {
+            scene_time += kVietnamUtcOffsetSeconds;
+            if (!ambient_sntp_stopped_) {
+                esp_sntp_stop();
+                ambient_sntp_stopped_ = true;
+                ESP_LOGI(kAmbientTag, "SNTP clock acquired; using UTC+7 for ambient scenes");
+            }
+        }
+
+        struct tm tm_now {};
+        gmtime_r(&scene_time, &tm_now);
         const int hour = tm_now.tm_hour;
+
+        if (hour != last_logged_hour_) {
+            last_logged_hour_ = hour;
+            ESP_LOGI(kAmbientTag, "Ambient local hour=%02d source=%s",
+                     hour, ambient_sntp_started_ ? "SNTP+UTC7" : "server_time");
+        }
+
         if (hour >= 5 && hour < 11) {
             return AmbientPeriod::Morning;
         }
@@ -214,6 +278,10 @@ private:
     }
 
     void UpdateAmbientLighting(AmbientPeriod period) {
+        if (period == AmbientPeriod::Unknown) {
+            return;
+        }
+
         if (period != ambient_period_) {
             ambient_period_ = period;
             ApplyAmbientBackground(period);
@@ -344,19 +412,25 @@ private:
     }
 
     void AmbientTick() {
-        if (ambient_boot_grace_ > 0) {
-            --ambient_boot_grace_;
-            return;
-        }
-
-        const AmbientPeriod period = GetAmbientPeriod();
-        UpdateAmbientLighting(period);
-
+        // Freeze all decorative work while booting, connecting, listening or
+        // speaking. This keeps ambient animation away from audio/network peaks.
         if (Application::GetInstance().GetDeviceState() != kDeviceStateIdle) {
             action_ticks_left_ = 2;
             return;
         }
 
+        // Do not touch the mmap asset table until the normal startup path has
+        // completed and validated it.
+        if (!Assets::GetInstance().checksum_valid()) {
+            return;
+        }
+
+        const AmbientPeriod period = GetAmbientPeriod();
+        if (period == AmbientPeriod::Unknown) {
+            return;
+        }
+
+        UpdateAmbientLighting(period);
         StepMochiPosition();
 
         if (action_ticks_left_ > 0) {
@@ -367,16 +441,23 @@ private:
         ChooseNextIdleAction();
     }
 
-    void StartAmbientTimer() {
-        esp_timer_create_args_t args = {};
-        args.callback = &Mochi183LcdDisplay::AmbientTimerThunk;
-        args.arg = this;
-        args.dispatch_method = ESP_TIMER_TASK;
-        args.name = "mochi_ambient";
-        args.skip_unhandled_events = true;
+    void StartAmbientTask() {
+        if (ambient_task_ != nullptr) {
+            return;
+        }
 
-        if (esp_timer_create(&args, &ambient_timer_) == ESP_OK) {
-            esp_timer_start_periodic(ambient_timer_, 1000000);
+        BaseType_t rc = xTaskCreatePinnedToCore(
+            &Mochi183LcdDisplay::AmbientTaskThunk,
+            "mochi_ambient",
+            6144,
+            this,
+            1,
+            &ambient_task_,
+            1);
+
+        if (rc != pdPASS) {
+            ambient_task_ = nullptr;
+            ESP_LOGE(kAmbientTag, "Failed to create ambient task");
         }
     }
 
@@ -393,14 +474,17 @@ public:
         : SpiLcdDisplay(panel_io, panel, width, height, offset_x, offset_y,
                         mirror_x, mirror_y, swap_xy) {
         ApplyMochiLayout();
-        StartAmbientTimer();
+        StartAmbientTask();
     }
 
     ~Mochi183LcdDisplay() override {
-        if (ambient_timer_ != nullptr) {
-            esp_timer_stop(ambient_timer_);
-            esp_timer_delete(ambient_timer_);
-            ambient_timer_ = nullptr;
+        if (ambient_task_ != nullptr) {
+            vTaskDelete(ambient_task_);
+            ambient_task_ = nullptr;
+        }
+        if (ambient_sntp_started_ && !ambient_sntp_stopped_) {
+            esp_sntp_stop();
+            ambient_sntp_stopped_ = true;
         }
     }
 
