@@ -4,36 +4,26 @@
 #include <lvgl.h>
 #include <cstring>
 
-// Mochi UI layer for the real 1.83-inch ST7789 board.
-// Keep the base LVGL parent/flex layout intact: re-parenting emoji_box_ was the
-// source of the previous missing/cropped pet regression. Only translate it.
 class Mochi183LcdDisplay : public SpiLcdDisplay {
 private:
     lv_obj_t* mochi_chat_bubble_ = nullptr;
     lv_obj_t* mochi_chat_label_ = nullptr;
 
     void ApplyMochiLayout() {
-        if (!Lock(1000)) {
-            return;
-        }
+        if (!Lock(1000)) return;
 
         lv_obj_t* screen = lv_screen_active();
 
-        // The stock empty chat label still participates in the vertical flex
-        // layout. Hide it because replies use our overlay bubble instead.
         if (chat_message_label_ != nullptr) {
             lv_obj_add_flag(chat_message_label_, LV_OBJ_FLAG_HIDDEN);
         }
 
-        // Keep GIF dimensions, decoder and parent untouched. With the old chat
-        // label hidden, the pet is centered by the stock layout; +50 px puts an
-        // 80-96 px Mochi safely near the bottom without clipping.
+        // Keep GIF decoder/parent untouched. Only move the LVGL object.
         if (emoji_box_ != nullptr) {
             lv_obj_set_style_translate_y(emoji_box_, 50, 0);
             lv_obj_move_foreground(emoji_box_);
         }
 
-        // Independent translucent assistant-response bubble near the top.
         mochi_chat_bubble_ = lv_obj_create(screen);
         lv_obj_set_width(mochi_chat_bubble_, 236);
         lv_obj_set_height(mochi_chat_bubble_, LV_SIZE_CONTENT);
@@ -60,7 +50,6 @@ private:
 
         lv_obj_add_flag(mochi_chat_bubble_, LV_OBJ_FLAG_HIDDEN);
         lv_obj_move_foreground(mochi_chat_bubble_);
-
         Unlock();
     }
 
@@ -80,21 +69,25 @@ public:
     }
 
     void SetChatMessage(const char* role, const char* content) override {
-        if (mochi_chat_bubble_ == nullptr || mochi_chat_label_ == nullptr) {
-            return;
-        }
-        if (!Lock(1000)) {
-            return;
-        }
+        if (mochi_chat_bubble_ == nullptr || mochi_chat_label_ == nullptr) return;
+        if (!Lock(1000)) return;
 
-        // Only spoken assistant replies use this bubble. User/system/status text
-        // stays out of the scene, preventing startup/status messages from
-        // covering Mochi or the room background.
-        const bool is_assistant = (role != nullptr && std::strcmp(role, "assistant") == 0);
-        if (!is_assistant || content == nullptr || content[0] == '\0') {
+        const bool is_user = role != nullptr && std::strcmp(role, "user") == 0;
+        const bool is_assistant = role != nullptr && std::strcmp(role, "assistant") == 0;
+
+        // Hide startup/system messages, but show STT user text first and then
+        // replace it with the assistant reply in the same lightweight bubble.
+        if ((!is_user && !is_assistant) || content == nullptr || content[0] == '\0') {
             lv_label_set_text(mochi_chat_label_, "");
             lv_obj_add_flag(mochi_chat_bubble_, LV_OBJ_FLAG_HIDDEN);
         } else {
+            if (is_user) {
+                lv_obj_set_style_bg_color(mochi_chat_bubble_, lv_color_hex(0xEAF3FF), 0);
+                lv_obj_set_style_border_color(mochi_chat_bubble_, lv_color_hex(0xC9D9EC), 0);
+            } else {
+                lv_obj_set_style_bg_color(mochi_chat_bubble_, lv_color_hex(0xF8F7F2), 0);
+                lv_obj_set_style_border_color(mochi_chat_bubble_, lv_color_hex(0xD8D6D0), 0);
+            }
             lv_label_set_text(mochi_chat_label_, content);
             lv_obj_remove_flag(mochi_chat_bubble_, LV_OBJ_FLAG_HIDDEN);
             lv_obj_align(mochi_chat_bubble_, LV_ALIGN_TOP_MID, 0, 48);
