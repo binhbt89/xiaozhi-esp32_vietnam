@@ -99,6 +99,20 @@ private:
             // Keep the radio awake during the voice transaction. This improves
             // websocket/audio stability on marginal WiFi at a small power cost.
             WifiStation::GetInstance().SetPowerSaveMode(false);
+
+            // A normal ToggleChatState() only sends AbortSpeaking while the
+            // assistant is talking; it does NOT transition back to listening.
+            // For this board the expected UX is barge-in: one click interrupts
+            // TTS and immediately resumes the same listening mode (AutoStop or
+            // Realtime) that the current conversation is already using.
+            if (app.GetDeviceState() == kDeviceStateSpeaking) {
+                app.Schedule([&app]() {
+                    app.AbortSpeaking(kAbortReasonNone);
+                    app.SetDeviceState(kDeviceStateListening);
+                });
+                return;
+            }
+
             app.ToggleChatState();
         });
 
