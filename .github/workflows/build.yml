@@ -24,36 +24,62 @@ jobs:
           python - <<'PY'
           from pathlib import Path
 
-          patches = {
-              Path('main/application.cc'): [
-                  ('}, "main_event_loop", 1024 * 3 + 512, this, 3, &main_event_loop_task_handle_);',
-                   '}, "main_event_loop", 2048 * 4, this, 3, &main_event_loop_task_handle_);'),
-              ],
-              Path('main/audio/audio_service.cc'): [
-                  ('}, "audio_input", 1024 * 3, this, 8, &audio_input_task_handle_, 0);',
-                   '}, "audio_input", 2048 * 3, this, 8, &audio_input_task_handle_, 0);'),
-                  ('}, "audio_output", 1024 * 3, this, 4, &audio_output_task_handle_);',
-                   '}, "audio_output", 2048 * 2, this, 4, &audio_output_task_handle_);'),
-                  ('}, "opus_codec", 1024 * 25, this, 2, &opus_codec_task_handle_);',
-                   '}, "opus_codec", 2048 * 13, this, 2, &opus_codec_task_handle_);'),
-              ],
-              Path('main/audio/wake_words/afe_wake_word.cc'): [
-                  ('}, "audio_detection", 1024 * 3, this, 3, nullptr);',
-                   '}, "audio_detection", 4096, this, 3, nullptr);'),
-              ],
-          }
+          # Main event loop: current fork 3584 -> factory-era 8192 bytes.
+          p = Path('main/application.cc')
+          text = p.read_text(encoding='utf-8')
+          old = '}, "main_event_loop", 1024 * 3 + 512, this, 3, &main_event_loop_task_handle_);'
+          new = '}, "main_event_loop", 2048 * 4, this, 3, &main_event_loop_task_handle_);'
+          if text.count(old) != 1:
+              raise SystemExit(f'{p}: main_event_loop pattern count={text.count(old)}')
+          p.write_text(text.replace(old, new), encoding='utf-8')
 
-          for path, replacements in patches.items():
-              text = path.read_text(encoding='utf-8')
-              for old, new in replacements:
-                  count = text.count(old)
-                  if count != 1:
-                      raise SystemExit(f'{path}: expected exactly one match for {old!r}, found {count}')
-                  text = text.replace(old, new)
-              path.write_text(text, encoding='utf-8')
-              print(f'patched {path}')
+          # Restore the two compile-time AudioService branches to the sizes used
+          # by upstream close to the stable factory firmware era.
+          p = Path('main/audio/audio_service.cc')
+          text = p.read_text(encoding='utf-8')
+          input_old = '}, "audio_input", 1024 * 3, this, 8, &audio_input_task_handle_'
+          output_old = '}, "audio_output", 1024 * 3, this, 4, &audio_output_task_handle_);'
+          if text.count(input_old) != 2 or text.count(output_old) != 2:
+              raise SystemExit(f'{p}: audio_input={text.count(input_old)}, audio_output={text.count(output_old)}')
+
+          # CONFIG_USE_AUDIO_PROCESSOR branch: input 6144, output 4096.
+          text = text.replace(
+              '}, "audio_input", 1024 * 3, this, 8, &audio_input_task_handle_, 0);',
+              '}, "audio_input", 2048 * 3, this, 8, &audio_input_task_handle_, 0);',
+              1)
+          text = text.replace(
+              '}, "audio_output", 1024 * 3, this, 4, &audio_output_task_handle_);',
+              '}, "audio_output", 2048 * 2, this, 4, &audio_output_task_handle_);',
+              1)
+
+          # Non-AFE branch: input 4096, output 2048.
+          text = text.replace(
+              '}, "audio_input", 1024 * 3, this, 8, &audio_input_task_handle_);',
+              '}, "audio_input", 2048 * 2, this, 8, &audio_input_task_handle_);',
+              1)
+          text = text.replace(
+              '}, "audio_output", 1024 * 3, this, 4, &audio_output_task_handle_);',
+              '}, "audio_output", 2048, this, 4, &audio_output_task_handle_);',
+              1)
+
+          opus_old = '}, "opus_codec", 1024 * 25, this, 2, &opus_codec_task_handle_);'
+          opus_new = '}, "opus_codec", 2048 * 13, this, 2, &opus_codec_task_handle_);'
+          if text.count(opus_old) != 1:
+              raise SystemExit(f'{p}: opus pattern count={text.count(opus_old)}')
+          text = text.replace(opus_old, opus_new)
+          p.write_text(text, encoding='utf-8')
+
+          # Wake-word detection: current fork 3072 -> factory-era 4096 bytes.
+          p = Path('main/audio/wake_words/afe_wake_word.cc')
+          text = p.read_text(encoding='utf-8')
+          old = '}, "audio_detection", 1024 * 3, this, 3, nullptr);'
+          new = '}, "audio_detection", 4096, this, 3, nullptr);'
+          if text.count(old) != 1:
+              raise SystemExit(f'{p}: audio_detection pattern count={text.count(old)}')
+          p.write_text(text.replace(old, new), encoding='utf-8')
           PY
 
+          echo 'Applied stack sizes:'
           grep -n 'main_event_loop"' main/application.cc
           grep -nE 'audio_input"|audio_output"|opus_codec"' main/audio/audio_service.cc
           grep -n 'audio_detection"' main/audio/wake_words/afe_wake_word.cc
