@@ -1,16 +1,16 @@
-name: Build Mochi Ambient Motion 10
+name: Build Mochi Ambient Fix 12
 
 on:
   push:
     branches:
-      - mochi-ambient-motion-10
+      - mochi-ambient-fix-12
 
 permissions:
   contents: read
 
 jobs:
   build:
-    name: Build Mochi ambient motion 10
+    name: Build Mochi ambient fix 12
     runs-on: ubuntu-latest
     container:
       image: espressif/idf:v5.5.1
@@ -77,12 +77,13 @@ jobs:
           grep -n "app.GetDeviceState() == kDeviceStateSpeaking" main/boards/xingzhi-cube-1.83tft-wifi/xingzhi-cube-1.83tft-wifi.cc
           grep -n "app.SetDeviceState(kDeviceStateListening)" main/boards/xingzhi-cube-1.83tft-wifi/xingzhi-cube-1.83tft-wifi.cc
 
-      - name: Verify ambient motion code
+      - name: Verify ambient fix 12 code
         shell: bash
         run: |
-          grep -n "ambient_walk_left" main/boards/xingzhi-cube-1.83tft-wifi/mochi_lcd_display.h
-          grep -n "background_night.raw" main/boards/xingzhi-cube-1.83tft-wifi/mochi_lcd_display.h
-          grep -n "mochi_ambient" main/boards/xingzhi-cube-1.83tft-wifi/mochi_lcd_display.h
+          grep -n "StartSntpFallback" main/boards/xingzhi-cube-1.83tft-wifi/mochi_lcd_display.h
+          grep -n "SNTP+UTC7" main/boards/xingzhi-cube-1.83tft-wifi/mochi_lcd_display.h
+          grep -n "xTaskCreatePinnedToCore" main/boards/xingzhi-cube-1.83tft-wifi/mochi_lcd_display.h
+          grep -n "checksum_valid" main/boards/xingzhi-cube-1.83tft-wifi/mochi_lcd_display.h
 
       - name: Build corrected 1.83 firmware
         shell: bash
@@ -96,7 +97,7 @@ jobs:
       - name: Upload firmware and debug symbols
         uses: actions/upload-artifact@v4
         with:
-          name: mochi_ambient_motion10_${{ github.sha }}
+          name: mochi_ambient_fix12_${{ github.sha }}
           path: |
             build/merged-binary.bin
             build/**/*.elf
