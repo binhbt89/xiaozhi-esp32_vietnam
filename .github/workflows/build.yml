@@ -1,16 +1,16 @@
-name: Build Mochi Ambient Fix 12
+name: Build Mochi Ambient Safe LVGL 13
 
 on:
   push:
     branches:
-      - mochi-ambient-fix-12
+      - mochi-ambient-safe-lvgl-13
 
 permissions:
   contents: read
 
 jobs:
   build:
-    name: Build Mochi ambient fix 12
+    name: Build Mochi ambient safe LVGL 13
     runs-on: ubuntu-latest
     container:
       image: espressif/idf:v5.5.1
@@ -77,13 +77,22 @@ jobs:
           grep -n "app.GetDeviceState() == kDeviceStateSpeaking" main/boards/xingzhi-cube-1.83tft-wifi/xingzhi-cube-1.83tft-wifi.cc
           grep -n "app.SetDeviceState(kDeviceStateListening)" main/boards/xingzhi-cube-1.83tft-wifi/xingzhi-cube-1.83tft-wifi.cc
 
-      - name: Verify ambient fix 12 code
+      - name: Verify ambient safe LVGL code
         shell: bash
         run: |
-          grep -n "StartSntpFallback" main/boards/xingzhi-cube-1.83tft-wifi/mochi_lcd_display.h
-          grep -n "SNTP+UTC7" main/boards/xingzhi-cube-1.83tft-wifi/mochi_lcd_display.h
-          grep -n "xTaskCreatePinnedToCore" main/boards/xingzhi-cube-1.83tft-wifi/mochi_lcd_display.h
-          grep -n "checksum_valid" main/boards/xingzhi-cube-1.83tft-wifi/mochi_lcd_display.h
+          H=main/boards/xingzhi-cube-1.83tft-wifi/mochi_lcd_display.h
+          grep -n "lv_timer_create" "$H"
+          grep -n "container_, active_background_" "$H"
+          grep -n "idle_stable_ticks_ < 5" "$H"
+          grep -n "SNTP fallback started" "$H"
+          if grep -n "xTaskCreatePinnedToCore" "$H"; then
+            echo "Unexpected dedicated ambient FreeRTOS task remains"
+            exit 1
+          fi
+          if grep -n "lv_obj_set_style_bg_image_src(screen" "$H"; then
+            echo "Unexpected screen background switch remains"
+            exit 1
+          fi
 
       - name: Build corrected 1.83 firmware
         shell: bash
@@ -97,7 +106,7 @@ jobs:
       - name: Upload firmware and debug symbols
         uses: actions/upload-artifact@v4
         with:
-          name: mochi_ambient_fix12_${{ github.sha }}
+          name: mochi_ambient_safe_lvgl13_${{ github.sha }}
           path: |
             build/merged-binary.bin
             build/**/*.elf
