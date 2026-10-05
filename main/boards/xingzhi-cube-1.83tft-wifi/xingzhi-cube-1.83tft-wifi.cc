@@ -86,9 +86,19 @@ private:
         boot_button_.OnClick([this]() {
             power_save_timer_->WakeUp();
             auto& app = Application::GetInstance();
-            if (app.GetDeviceState() == kDeviceStateStarting && !WifiStation::GetInstance().IsConnected()) {
-                ResetWifiConfiguration();
+
+            // The stock board code erased WiFi settings if this button was
+            // pressed while startup WiFi was temporarily disconnected. With a
+            // weak signal that can look like a random reboot into WiFi setup.
+            // Never reset credentials from the normal talk button.
+            if (app.GetDeviceState() == kDeviceStateStarting) {
+                ESP_LOGW(TAG, "Talk button ignored while startup/network init is still running");
+                return;
             }
+
+            // Keep the radio awake during the voice transaction. This improves
+            // websocket/audio stability on marginal WiFi at a small power cost.
+            WifiStation::GetInstance().SetPowerSaveMode(false);
             app.ToggleChatState();
         });
 
@@ -96,9 +106,7 @@ private:
             power_save_timer_->WakeUp();
             auto codec = GetAudioCodec();
             auto volume = codec->output_volume() + 10;
-            if (volume > 100) {
-                volume = 100;
-            }
+            if (volume > 100) volume = 100;
             codec->SetOutputVolume(volume);
             GetDisplay()->ShowNotification(Lang::Strings::VOLUME + std::to_string(volume));
         });
@@ -113,9 +121,7 @@ private:
             power_save_timer_->WakeUp();
             auto codec = GetAudioCodec();
             auto volume = codec->output_volume() - 10;
-            if (volume < 0) {
-                volume = 0;
-            }
+            if (volume < 0) volume = 0;
             codec->SetOutputVolume(volume);
             GetDisplay()->ShowNotification(Lang::Strings::VOLUME + std::to_string(volume));
         });
@@ -166,7 +172,6 @@ public:
         InitializeSpi();
         InitializeButtons();
         InitializeSt7789Display();
-        // Use a deterministic runtime brightness instead of a stale saved value.
         GetBacklight()->SetBrightness(MOCHI_BACKLIGHT_PERCENT, false);
     }
 
@@ -180,7 +185,7 @@ public:
     virtual Display* GetDisplay() override {
         return display_;
     }
-    
+
     virtual Backlight* GetBacklight() override {
         static PwmBacklight backlight(DISPLAY_BACKLIGHT_PIN, DISPLAY_BACKLIGHT_OUTPUT_INVERT);
         return &backlight;
