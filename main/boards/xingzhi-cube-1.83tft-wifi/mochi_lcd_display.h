@@ -4,6 +4,7 @@
 #include "display/lvgl_display/lvgl_image.h"
 #include "application.h"
 #include "assets.h"
+#include "pet/pet_state_engine.h"
 
 #include <lvgl.h>
 #include <esp_random.h>
@@ -252,9 +253,66 @@ private:
     }
 
     void ChooseNextIdleActionLvgl() {
-        const uint32_t roll = esp_random() % 100;
+        // Snapshot is read only when choosing a new action (every few seconds),
+        // never every 200ms tick. PetStateEngine itself performs no LVGL/network
+        // work, so this preserves the Fix14 LVGL safety model.
+        const auto pet = PetStateEngine::GetInstance().GetSnapshot();
 
-        if (roll < 52) {
+        // Logical sleep has absolute priority over decorative random behavior.
+        // Voice UI still overrides this because AmbientTickLvgl pauses whenever
+        // Application leaves Idle; after voice settles, sleep visuals resume.
+        if (pet.sleeping) {
+            mochi_target_x_ = mochi_x_;
+            QueueAmbientEmotion("ambient_sleep");
+            action_ticks_left_ = 40 + static_cast<int>(esp_random() % 21); // 8-12s
+            return;
+        }
+
+        int walk_weight = 52;
+        int sit_weight = 18;
+        int lie_weight = 12;
+        int sleep_weight = 8;
+        int idle_weight = 10;
+
+        // Tired Mochi becomes visibly calmer before the auto-sleep threshold.
+        if (pet.energy <= 35) {
+            walk_weight = 10;
+            sit_weight = 25;
+            lie_weight = 40;
+            sleep_weight = 20;
+            idle_weight = 5;
+        // Hunger also suppresses energetic wandering, but less strongly than
+        // true low Energy so hunger and fatigue remain visually distinguishable.
+        } else if (pet.hunger >= 75) {
+            walk_weight = 18;
+            sit_weight = 38;
+            lie_weight = 24;
+            sleep_weight = 10;
+            idle_weight = 10;
+        // A happy, well-rested Mochi is more lively. No new asset is required;
+        // we express this only through the stable Fix14 walk/idle set.
+        } else if (pet.mood >= 80 && pet.energy >= 50 && pet.hunger < 70) {
+            walk_weight = 60;
+            sit_weight = 12;
+            lie_weight = 8;
+            sleep_weight = 4;
+            idle_weight = 16;
+        }
+
+        // Friendship is a light long-term bias, not a dominant state. Higher
+        // friendship slightly favors active/attentive behavior without making
+        // low Energy or hunger disappear.
+        if (pet.friendship >= 60 && pet.energy > 35 && pet.hunger < 75) {
+            walk_weight += 4;
+            idle_weight += 4;
+            sit_weight = std::max(6, sit_weight - 4);
+            lie_weight = std::max(5, lie_weight - 4);
+        }
+
+        const int total_weight = walk_weight + sit_weight + lie_weight + sleep_weight + idle_weight;
+        int roll = static_cast<int>(esp_random() % static_cast<uint32_t>(total_weight));
+
+        if (roll < walk_weight) {
             const int positions[] = {-50, -25, 0, 25, 50};
             mochi_target_x_ = positions[esp_random() % 5];
             if (mochi_target_x_ == mochi_x_) {
@@ -269,20 +327,36 @@ private:
 
             int distance = std::abs(mochi_target_x_ - mochi_x_);
             action_ticks_left_ = std::max(2, (distance + kMoveStepPx - 1) / kMoveStepPx);
-        } else if (roll < 70) {
+            return;
+        }
+
+        roll -= walk_weight;
+        if (roll < sit_weight) {
+            mochi_target_x_ = mochi_x_;
             QueueAmbientEmotion("ambient_sit");
             action_ticks_left_ = 20 + static_cast<int>(esp_random() % 16); // 4.0-7.0s
-        } else if (roll < 82) {
+            return;
+        }
+
+        roll -= sit_weight;
+        if (roll < lie_weight) {
+            mochi_target_x_ = mochi_x_;
             QueueAmbientEmotion("ambient_lie");
             action_ticks_left_ = 25 + static_cast<int>(esp_random() % 16); // 5.0-8.0s
-        } else if (roll < 90) {
+            return;
+        }
+
+        roll -= lie_weight;
+        if (roll < sleep_weight) {
+            mochi_target_x_ = mochi_x_;
             QueueAmbientEmotion("ambient_sleep");
             action_ticks_left_ = 40 + static_cast<int>(esp_random() % 21); // 8.0-12.0s
-        } else {
-            QueueAmbientEmotion("ambient_idle");
-            mochi_target_x_ = mochi_x_;
-            action_ticks_left_ = 10 + static_cast<int>(esp_random() % 16); // 2.0-5.0s
+            return;
         }
+
+        mochi_target_x_ = mochi_x_;
+        QueueAmbientEmotion("ambient_idle");
+        action_ticks_left_ = 10 + static_cast<int>(esp_random() % 16); // 2.0-5.0s
     }
 
     void StepMochiPositionLvgl() {
