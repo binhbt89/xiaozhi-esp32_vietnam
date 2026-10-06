@@ -72,13 +72,13 @@ void WifiBoard::EnterWifiConfigMode() {
 }
 
 void WifiBoard::StartNetwork() {
-    // User can press BOOT button while starting to enter WiFi configuration mode
+    // User can explicitly request WiFi configuration mode with the stored flag.
     if (wifi_config_mode_) {
         EnterWifiConfigMode();
         return;
     }
 
-    // If no WiFi SSID is configured, enter WiFi configuration mode
+    // First-time setup still enters AP configuration immediately.
     auto& ssid_manager = SsidManager::GetInstance();
     auto ssid_list = ssid_manager.GetSsidList();
     if (ssid_list.empty()) {
@@ -105,18 +105,20 @@ void WifiBoard::StartNetwork() {
         notification += ssid;
         display->ShowNotification(notification.c_str(), 30000);
         
-        // Debug log: Print IP address when WiFi connected
         std::string ip_address = WifiStation::GetInstance().GetIpAddress();
         ESP_LOGI(TAG, "WiFi connected successfully - SSID: %s, IP Address: %s", ssid.c_str(), ip_address.c_str());
     });
     wifi_station.Start();
 
-    // Try to connect to WiFi, if failed, launch the WiFi configuration AP
-    if (!wifi_station.WaitForConnected(60 * 1000)) {
-        wifi_station.Stop();
-        wifi_config_mode_ = true;
-        EnterWifiConfigMode();
-        return;
+    // Mochi 15B: once a network has been provisioned, never discard station
+    // mode merely because the router was unavailable during the first minute.
+    // WifiStation already performs 5 reconnect attempts and periodic 10-second
+    // rescans. Keep that mechanism alive until a saved AP returns. This avoids
+    // requiring a reboot after router/power outages and preserves credentials.
+    while (!wifi_station.WaitForConnected(60 * 1000)) {
+        ESP_LOGW(TAG, "Saved WiFi is still unavailable; keeping reconnect/rescan active");
+        auto display = Board::GetInstance().GetDisplay();
+        display->ShowNotification(Lang::Strings::SCANNING_WIFI, 30000);
     }
 }
 
@@ -236,7 +238,7 @@ std::string WifiBoard::GetDeviceStatusJson() {
     bool discharging = false;
     if (board.GetBatteryLevel(battery_level, charging, discharging)) {
         cJSON* battery = cJSON_CreateObject();
-        cJSON_AddNumberToObject(battery, "level", battery_level);
+        cJSON_AddNumberToObject(battery, "level", level);
         cJSON_AddBoolToObject(battery, "charging", charging);
         cJSON_AddItemToObject(root, "battery", battery);
     }
