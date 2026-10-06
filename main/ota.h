@@ -15,7 +15,13 @@ public:
     bool CheckVersion(std::string& url);
     esp_err_t Activate();
     bool HasActivationChallenge() { return has_activation_challenge_; }
-    bool HasNewVersion() { return has_new_version_; }
+
+    // Mochi owns its firmware lifecycle. The bootstrap request is still kept
+    // because it supplies MQTT/WebSocket/activation/time configuration, but a
+    // server-advertised firmware must never auto-replace our hardware-tested
+    // Mochi build. Manual/local OTA facilities remain available separately.
+    bool HasNewVersion() { return false; }
+
     bool HasMqttConfig() { return has_mqtt_config_; }
     bool HasWebsocketConfig() { return has_websocket_config_; }
     bool HasActivationCode() { return has_activation_code_; }
