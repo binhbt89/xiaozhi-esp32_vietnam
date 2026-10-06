@@ -43,14 +43,10 @@ public:
         last_save_monotonic_us_ = last_monotonic_us_;
         initialized_ = true;
 
-        // Offline catch-up is bounded. Most importantly, Energy only recovers
-        // across a reboot when Mochi was explicitly saved as sleeping.
-        const int32_t now_epoch = CurrentValidEpoch();
-        if (last_update_epoch_ > 0 && now_epoch > last_update_epoch_) {
-            int32_t elapsed = now_epoch - last_update_epoch_;
-            elapsed = std::min<int32_t>(elapsed, kMaxOfflineSimulationSeconds);
-            ApplyElapsedLocked(static_cast<uint32_t>(elapsed));
-        }
+        // On this board PetStateEngine starts before the OTA/bootstrap path may
+        // establish wall-clock time. Reconciliation therefore stays pending
+        // until CurrentValidEpoch() becomes trustworthy later in normal runtime.
+        TryReconcileOfflineSleepLocked();
 
         ESP_LOGI(kTag,
                  "Pet core ready H=%u E=%u M=%u F=%u coins=%ld sleep=%d",
@@ -91,8 +87,6 @@ public:
 
     // 15B basic Play action. There is intentionally no minigame here yet:
     // Play simply makes Mochi happier and spends a small amount of Energy.
-    // Energy is never regenerated while awake, so future games can share the
-    // same anti-spam resource without changing this state model.
     bool Play(uint8_t energy_cost = 10, uint8_t mood_bonus = 10) {
         std::lock_guard<std::mutex> lock(mutex_);
         EnsureInitializedLocked();
@@ -107,7 +101,10 @@ public:
         state_.friendship = AddClamp(state_.friendship, 1);
         TouchInteractionLocked();
         dirty_ = true;
-        CheckpointIfDueLocked();
+
+        // Play is Energy-limited, so immediate persistence remains low-wear and
+        // prevents power-cycling from restoring Energy that was already spent.
+        SaveLocked(esp_timer_get_time());
         return true;
     }
 
@@ -118,7 +115,7 @@ public:
         return !state_.sleeping && energy_cost > 0 && state_.energy >= energy_cost;
     }
 
-    // Future minigames call this only after their own gameplay succeeds.
+    // Future minigames call this only after their gameplay succeeds.
     void CompletePlay(int32_t coin_reward, uint8_t mood_bonus = 10,
                       uint8_t energy_cost = 15, uint8_t hunger_cost = 3) {
         std::lock_guard<std::mutex> lock(mutex_);
@@ -136,7 +133,7 @@ public:
         state_.friendship = AddClamp(state_.friendship, 2);
         TouchInteractionLocked();
         dirty_ = true;
-        CheckpointIfDueLocked();
+        SaveLocked(esp_timer_get_time());
     }
 
     void Pet() {
@@ -158,8 +155,7 @@ public:
             state_.sleeping = true;
             dirty_ = true;
             // Sleep/wake boundaries are rare and semantically important. Save
-            // immediately so a real power loss during sleep can recover Energy
-            // correctly on the next boot.
+            // immediately so a real power loss during sleep can recover Energy.
             SaveLocked(esp_timer_get_time());
         }
     }
@@ -172,8 +168,7 @@ public:
             state_.sleeping = false;
             TouchInteractionLocked();
             dirty_ = true;
-            // Persist awake state immediately; otherwise a sudden power cut
-            // could incorrectly grant offline sleep recovery next boot.
+            // Persist awake immediately so power loss cannot grant fake sleep.
             SaveLocked(esp_timer_get_time());
         }
     }
@@ -229,9 +224,8 @@ private:
     static constexpr int32_t kMaxCoins = 999999;
     static constexpr uint8_t kAutoSleepEnergy = 20;
 
-    // Hunger still changes gently over time. Energy is different: it never
-    // decays or regenerates merely because Mochi is awake. Activities spend it;
-    // only logical Sleep restores it, slowly: +1 every 3 minutes (~5h 0->100).
+    // Hunger changes gently. Energy never changes merely because Mochi is
+    // awake: activities spend it, and only logical Sleep restores it slowly.
     static constexpr uint32_t kAwakeHungerStepSeconds = 12 * 60;
     static constexpr uint32_t kSleepHungerStepSeconds = 20 * 60;
     static constexpr uint32_t kSleepEnergyStepSeconds = 3 * 60;
@@ -243,6 +237,7 @@ private:
     std::mutex mutex_;
     bool initialized_ = false;
     bool dirty_ = false;
+    bool offline_sleep_reconciled_ = false;
     int32_t last_update_epoch_ = 0;
     int64_t last_monotonic_us_ = 0;
     int64_t last_save_monotonic_us_ = 0;
@@ -274,6 +269,7 @@ private:
         last_monotonic_us_ = esp_timer_get_time();
         last_save_monotonic_us_ = last_monotonic_us_;
         initialized_ = true;
+        TryReconcileOfflineSleepLocked();
     }
 
     static uint32_t PackStats(const Snapshot& s) {
@@ -329,7 +325,44 @@ private:
         nvs_close(handle);
     }
 
+    void TryReconcileOfflineSleepLocked() {
+        if (offline_sleep_reconciled_) {
+            return;
+        }
+        if (last_update_epoch_ <= 0) {
+            offline_sleep_reconciled_ = true;
+            return;
+        }
+
+        const int32_t now_epoch = CurrentValidEpoch();
+        if (now_epoch <= 0) {
+            return; // Clock not ready yet; retry lazily later.
+        }
+
+        if (state_.sleeping && now_epoch > last_update_epoch_) {
+            int32_t elapsed = now_epoch - last_update_epoch_;
+            elapsed = std::min<int32_t>(elapsed, kMaxOfflineSimulationSeconds);
+
+            // Only sleep Energy is reconciled across reboot. This deliberately
+            // avoids punishing hunger/mood when server-time and SNTP timezone
+            // semantics differ in the upstream firmware.
+            energy_remainder_s_ += static_cast<uint32_t>(elapsed);
+            if (energy_remainder_s_ >= kSleepEnergyStepSeconds) {
+                const uint32_t steps = energy_remainder_s_ / kSleepEnergyStepSeconds;
+                energy_remainder_s_ %= kSleepEnergyStepSeconds;
+                const uint8_t before = state_.energy;
+                state_.energy = AddClamp(state_.energy, steps);
+                dirty_ = dirty_ || state_.energy != before;
+                ESP_LOGI(kTag, "Offline sleep recovery: +%u Energy", state_.energy - before);
+            }
+        }
+
+        offline_sleep_reconciled_ = true;
+    }
+
     void UpdateRuntimeLocked() {
+        TryReconcileOfflineSleepLocked();
+
         const int64_t now_us = esp_timer_get_time();
         if (last_monotonic_us_ == 0) {
             last_monotonic_us_ = now_us;
