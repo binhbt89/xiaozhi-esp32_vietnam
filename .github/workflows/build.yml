@@ -1,16 +1,16 @@
-name: Build Mochi HUD Menu Foundation 15D
+name: Build Mochi HUD Polish 15E
 
 on:
   push:
     branches:
-      - mochi-hud-menu-foundation-15d
+      - mochi-hud-polish-icons-15e
 
 permissions:
   contents: read
 
 jobs:
   build:
-    name: Build Mochi HUD menu foundation 15D
+    name: Build Mochi HUD polish 15E
     runs-on: ubuntu-latest
     container:
       image: espressif/idf:v5.5.1
@@ -130,6 +130,11 @@ jobs:
           p.write_text(text, encoding='utf-8')
           PY
 
+      - name: Apply 15E HUD polish and 1-second menu hold
+        shell: bash
+        run: |
+          python scripts/patch_mochi_15e.py
+
       - name: Verify Fix14 voice animation baseline
         shell: bash
         run: |
@@ -164,66 +169,69 @@ jobs:
             exit 1
           fi
 
-      - name: Verify 15C pet lifecycle baseline
+      - name: Verify 15C and 15D pet foundations
         shell: bash
         run: |
           P=main/pet/pet_state_engine.h
           A=main/application.cc
+          H=main/boards/xingzhi-cube-1.83tft-wifi/mochi_lcd_display.h
+
           grep -n "bool manual_sleep = false" "$P"
           grep -n "LifecycleTransition ServiceIdleLifecycle" "$P"
           grep -n "kAutoWakeEnergy = 90" "$P"
           grep -n "ServiceIdleLifecycle" "$A"
+          grep -n "uint8_t fullness = 84" "$P"
+          grep -n "kSchemaVersion = 2" "$P"
+          grep -n "kMaxStat = 99" "$P"
+          grep -n "kMaxCoins = 999" "$P"
+          grep -n "RequestMenuToggle" "$H"
+          grep -n "RequestMenuMove" "$H"
+          grep -n "RequestMenuSelect" "$H"
+
           if grep -nE "xTaskCreate|lv_|esp_sntp|http|websocket" "$P"; then
             echo "Pet core must not own tasks, LVGL, SNTP, or network work"
             exit 1
           fi
 
-      - name: Verify HUD Menu Foundation 15D
+      - name: Verify HUD Polish 15E
         shell: bash
         run: |
-          P=main/pet/pet_state_engine.h
           H=main/boards/xingzhi-cube-1.83tft-wifi/mochi_lcd_display.h
           B=main/boards/xingzhi-cube-1.83tft-wifi/xingzhi-cube-1.83tft-wifi.cc
 
-          grep -n "uint8_t fullness = 84" "$P"
-          grep -n "kSchemaVersion = 2" "$P"
-          grep -n "kLegacySchemaVersion = 1" "$P"
-          grep -n "kMaxStat = 99" "$P"
-          grep -n "kMaxCoins = 999" "$P"
-          grep -n "Migrating pet NVS v1 Hunger -> v2 Fullness" "$P"
-          grep -n "state_.fullness = SubClamp" "$P"
-
-          grep -n "kHudWidthPx = 38" "$H"
-          grep -n "StatusBarHeightLvgl" "$H"
-          grep -n "CreateHudLvgl" "$H"
-          grep -n "LV_HOR_RES - kHudWidthPx - kHudRightMarginPx" "$H"
-          grep -n "RefreshHudLvgl" "$H"
-          grep -n "RequestMenuToggle" "$H"
-          grep -n "RequestMenuMove" "$H"
-          grep -n "RequestMenuSelect" "$H"
-          grep -n "Application::GetInstance().Schedule" "$H"
-          grep -n "Voice always wins" "$H"
-
-          grep -n "MOCHI_MENU_LONG_PRESS_MS 2000" "$B"
+          grep -n "kHudWidthPx = 30" "$H"
+          grep -n "kHudRightMarginPx = 8" "$H"
+          grep -n "kHudTopGapPx = 4" "$H"
+          grep -n "kHudBottomSafePx = 16" "$H"
+          grep -n "CreateHudIconLvgl" "$H"
+          grep -n "MakeHudShapeLvgl" "$H"
+          grep -n "Fullness: warm food bowl" "$H"
+          grep -n "Energy: compact blocky lightning bolt" "$H"
+          grep -n "Mood: small smiling face" "$H"
+          grep -n "Friendship: pixel-heart silhouette" "$H"
+          grep -n "Coin: gold coin" "$H"
+          grep -n "lv_obj_set_size(row, 27, 30)" "$H"
+          grep -n "lv_obj_set_width(hud_value_labels_\[i\], 27)" "$H"
+          grep -n "MOCHI_MENU_LONG_PRESS_MS 1000" "$B"
           grep -n "boot_button_(BOOT_BUTTON_GPIO, false, MOCHI_MENU_LONG_PRESS_MS, 50)" "$B"
           grep -n "boot_button_.OnPressDown" "$B"
           grep -n "boot_button_.OnLongPress" "$B"
           grep -n "boot_button_.OnPressUp" "$B"
-          grep -n "HandleMenuMoveIfOpen(-1)" "$B"
-          grep -n "HandleMenuMoveIfOpen(1)" "$B"
 
-          # Talk short is intentionally implemented through PressUp; registering
-          # SINGLE_CLICK again would risk release-after-long launching voice.
-          if grep -n "boot_button_.OnClick" "$B"; then
-            echo "15D Talk must not register OnClick"
+          if grep -n "kHudIcons" "$H"; then
+            echo "15E HUD must not use temporary text/font icons"
             exit 1
           fi
-          if grep -n "pet.hunger\|state_.hunger" "$H" "$P"; then
-            echo "Legacy inverse Hunger semantics leaked into 15D"
+          if grep -n "MOCHI_MENU_LONG_PRESS_MS 2000" "$B"; then
+            echo "15E must use a one-second Talk hold"
+            exit 1
+          fi
+          if grep -n "boot_button_.OnClick" "$B"; then
+            echo "Talk must not register OnClick; release-after-long protection required"
             exit 1
           fi
           if grep -n "xTaskCreatePinnedToCore\|xTaskCreate(" "$H"; then
-            echo "15D UI must not add a FreeRTOS task"
+            echo "15E UI must not add a FreeRTOS task"
             exit 1
           fi
 
@@ -252,52 +260,51 @@ jobs:
 
           rm -rf flash_package
           mkdir -p flash_package
-          cp "$APP" flash_package/MOCHI_HUD_MENU_FOUNDATION_15D_APP.bin
+          cp "$APP" flash_package/MOCHI_HUD_POLISH_ICONS_15E_APP.bin
           cp build/xiaozhi_vn.elf flash_package/
           cp build/xiaozhi_vn.map flash_package/
-          (cd flash_package && sha256sum MOCHI_HUD_MENU_FOUNDATION_15D_APP.bin > SHA256.txt)
+          (cd flash_package && sha256sum MOCHI_HUD_POLISH_ICONS_15E_APP.bin > SHA256.txt)
           cat > flash_package/FLASH_INSTRUCTIONS.txt <<'EOF'
-          MOCHI HUD + MENU FOUNDATION 15D - APP ONLY
+          MOCHI HUD POLISH + CUSTOM ICONS 15E - APP ONLY
 
-          Baseline: Pet Behavior V1 15C hardware-PASS.
-          Branch: mochi-hud-menu-foundation-15d
+          Baseline: HUD Menu Foundation 15D hardware-PASS.
+          Branch: mochi-hud-polish-icons-15e
 
           Flash ONLY this APP image at 0x20000.
           Do NOT erase flash.
           Do NOT flash merged-binary.bin at 0x0.
-          Assets are unchanged from Fix14/15B/15C.
+          Background/pet assets are unchanged.
 
           Windows example (replace COM5 if needed):
-          python -m esptool --chip esp32s3 --port COM5 --baud 921600 write-flash 0x20000 MOCHI_HUD_MENU_FOUNDATION_15D_APP.bin
+          python -m esptool --chip esp32s3 --port COM5 --baud 921600 write-flash 0x20000 MOCHI_HUD_POLISH_ICONS_15E_APP.bin
 
-          15D changes:
-          - Main-screen right HUD starts below the existing status bar.
-          - Fullness/Energy/Mood/Friendship are 00..99; Coin is 000..999.
-          - NVS v1 Hunger is migrated once to intuitive v2 Fullness (0 hungry, 99 full).
-          - Hold Talk for 2 seconds while Idle to open/close the overlay menu.
-          - Menu controls: Vol+ up, Vol- down, Talk short Select/OK.
-          - Menu V1 actions: Pet, Play (-10 Energy), Sleep/Wake, Close.
-          - Voice has higher priority than menu and closes menu when voice activates.
-          - Talk short outside menu preserves the 15C voice/barge-in behavior.
-          - Menu/HUD LVGL mutation stays on the existing 200ms LVGL timer; no new task.
-          - Pet state mutations selected in menu are scheduled to Application/main context.
+          15E changes:
+          - Talk menu long-press reduced from 2 seconds to 1 second.
+          - Release-after-long protection remains unchanged; opening menu must not start voice.
+          - HUD remains ONE narrow right-side column: icon above, value below.
+          - HUD width reduced from 38px to 30px and shifted 8px inward from the right edge.
+          - Bottom safe margin added so Coin does not sit in the rounded lower-right corner.
+          - Temporary N / + / :) / <3 / $ glyphs removed.
+          - Five icons are hand-drawn with tiny LVGL geometry: food bowl, lightning, smile, heart, coin.
+          - No icon font and no new external asset partition.
+          - Fullness/Energy/Mood/Friendship remain 00..99; Coin remains 000..999.
+          - Voice, Wi-Fi, OTA, pet logic, backgrounds and animation baseline are unchanged.
 
           Hardware test focus:
-          1. APP-only flash without erase; Wi-Fi and pet NVS must remain.
-          2. Verify top Wi-Fi/device/battery status bar is unobstructed.
-          3. Verify the right HUD is readable and does not cover Mochi.
-          4. Hold Talk ~2s: menu opens. Release must NOT start voice.
-          5. Vol+/Vol- move selection; Talk short selects.
-          6. Close menu, then Talk short starts voice normally.
-          7. During TTS, Talk short must still abort speech and immediately listen.
-          8. Play should reduce Energy by 10 on the HUD; Sleep/Wake should update behavior.
-          9. Run 10-20 voice exchanges and leave idle 15-30 min; no reboot/Guru Meditation.
+          1. Verify the top system status bar is still unobstructed.
+          2. Verify every HUD icon is clearly separated from its number underneath.
+          3. Verify the entire HUD is narrower and leaves more scenery visible.
+          4. Verify Coin/000..999 stays clear of the lower-right rounded corner.
+          5. Hold Talk about 1 second: menu opens/closes; release must NOT start voice.
+          6. Menu navigation and Pet/Play/Sleep/Wake remain functional.
+          7. Outside menu, Talk short and TTS barge-in remain identical to 15D.
+          8. Run normal voice/idle regression testing and watch for reboot/Guru Meditation.
           EOF
 
       - name: Upload APP-only firmware and debug symbols
         uses: actions/upload-artifact@v4
         with:
-          name: mochi_hud_menu_foundation_15d_app_${{ github.sha }}
+          name: mochi_hud_polish_icons_15e_app_${{ github.sha }}
           path: flash_package/
           if-no-files-found: error
           retention-days: 30
