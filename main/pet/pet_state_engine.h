@@ -43,10 +43,8 @@ public:
         last_save_monotonic_us_ = last_monotonic_us_;
         initialized_ = true;
 
-        // Reconcile a bounded amount of elapsed wall time. We intentionally
-        // stay conservative because the existing firmware may source time from
-        // either OTA server time or SNTP. A bad/shifted clock must never punish
-        // the pet with an unbounded state jump.
+        // Offline catch-up is bounded. Most importantly, Energy only recovers
+        // across a reboot when Mochi was explicitly saved as sleeping.
         const int32_t now_epoch = CurrentValidEpoch();
         if (last_update_epoch_ > 0 && now_epoch > last_update_epoch_) {
             int32_t elapsed = now_epoch - last_update_epoch_;
@@ -67,16 +65,12 @@ public:
         return state_;
     }
 
-    // Cheap lazy update. Safe to call often; actual stat work runs only after
-    // enough monotonic time has accumulated.
     void Tick() {
         std::lock_guard<std::mutex> lock(mutex_);
         EnsureInitializedLocked();
         UpdateRuntimeLocked();
     }
 
-    // Generic food transaction. Future food items only need to provide price
-    // and effects; the engine does not need to know menu/UI details.
     bool Feed(int32_t price, uint8_t hunger_relief, uint8_t mood_bonus = 3) {
         std::lock_guard<std::mutex> lock(mutex_);
         EnsureInitializedLocked();
@@ -91,16 +85,48 @@ public:
         state_.sleeping = false;
         TouchInteractionLocked();
         dirty_ = true;
+        CheckpointIfDueLocked();
         return true;
     }
 
-    // Called after a future minigame finishes. Reward and costs are arguments
-    // so multiple simple games can share the same pet/economy core.
-    void CompletePlay(int32_t coin_reward, uint8_t mood_bonus = 10,
-                      uint8_t energy_cost = 8, uint8_t hunger_cost = 3) {
+    // 15B basic Play action. There is intentionally no minigame here yet:
+    // Play simply makes Mochi happier and spends a small amount of Energy.
+    // Energy is never regenerated while awake, so future games can share the
+    // same anti-spam resource without changing this state model.
+    bool Play(uint8_t energy_cost = 10, uint8_t mood_bonus = 10) {
         std::lock_guard<std::mutex> lock(mutex_);
         EnsureInitializedLocked();
         UpdateRuntimeLocked();
+        if (state_.sleeping || energy_cost == 0 || state_.energy < energy_cost) {
+            return false;
+        }
+
+        state_.energy = SubClamp(state_.energy, energy_cost);
+        state_.mood = AddClamp(state_.mood, mood_bonus);
+        state_.hunger = AddClamp(state_.hunger, 2);
+        state_.friendship = AddClamp(state_.friendship, 1);
+        TouchInteractionLocked();
+        dirty_ = true;
+        CheckpointIfDueLocked();
+        return true;
+    }
+
+    bool CanPlay(uint8_t energy_cost = 10) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        EnsureInitializedLocked();
+        UpdateRuntimeLocked();
+        return !state_.sleeping && energy_cost > 0 && state_.energy >= energy_cost;
+    }
+
+    // Future minigames call this only after their own gameplay succeeds.
+    void CompletePlay(int32_t coin_reward, uint8_t mood_bonus = 10,
+                      uint8_t energy_cost = 15, uint8_t hunger_cost = 3) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        EnsureInitializedLocked();
+        UpdateRuntimeLocked();
+        if (state_.sleeping || state_.energy < energy_cost) {
+            return;
+        }
         if (coin_reward > 0) {
             state_.coins = std::min<int32_t>(kMaxCoins, state_.coins + coin_reward);
         }
@@ -108,9 +134,9 @@ public:
         state_.energy = SubClamp(state_.energy, energy_cost);
         state_.hunger = AddClamp(state_.hunger, hunger_cost);
         state_.friendship = AddClamp(state_.friendship, 2);
-        state_.sleeping = false;
         TouchInteractionLocked();
         dirty_ = true;
+        CheckpointIfDueLocked();
     }
 
     void Pet() {
@@ -121,6 +147,7 @@ public:
         state_.friendship = AddClamp(state_.friendship, 1);
         TouchInteractionLocked();
         dirty_ = true;
+        CheckpointIfDueLocked();
     }
 
     void Sleep() {
@@ -130,6 +157,10 @@ public:
         if (!state_.sleeping) {
             state_.sleeping = true;
             dirty_ = true;
+            // Sleep/wake boundaries are rare and semantically important. Save
+            // immediately so a real power loss during sleep can recover Energy
+            // correctly on the next boot.
+            SaveLocked(esp_timer_get_time());
         }
     }
 
@@ -141,6 +172,9 @@ public:
             state_.sleeping = false;
             TouchInteractionLocked();
             dirty_ = true;
+            // Persist awake state immediately; otherwise a sudden power cut
+            // could incorrectly grant offline sleep recovery next boot.
+            SaveLocked(esp_timer_get_time());
         }
     }
 
@@ -157,11 +191,12 @@ public:
         return price >= 0 && state_.coins >= price;
     }
 
-    // Designed for a future safe application-idle checkpoint. It does nothing
-    // unless the state changed and at least ten minutes passed since last save.
+    // Safe lazy checkpoint for non-critical state changes. No flash write occurs
+    // unless the state is dirty and at least ten minutes passed since last save.
     bool MaybeSave() {
         std::lock_guard<std::mutex> lock(mutex_);
         EnsureInitializedLocked();
+        UpdateRuntimeLocked();
         if (!dirty_) {
             return true;
         }
@@ -194,11 +229,12 @@ private:
     static constexpr int32_t kMaxCoins = 999999;
     static constexpr uint8_t kAutoSleepEnergy = 20;
 
-    // Gentle rates: state influences behavior, but neglect is not punitive.
+    // Hunger still changes gently over time. Energy is different: it never
+    // decays or regenerates merely because Mochi is awake. Activities spend it;
+    // only logical Sleep restores it, slowly: +1 every 3 minutes (~5h 0->100).
     static constexpr uint32_t kAwakeHungerStepSeconds = 12 * 60;
     static constexpr uint32_t kSleepHungerStepSeconds = 20 * 60;
-    static constexpr uint32_t kAwakeEnergyStepSeconds = 10 * 60;
-    static constexpr uint32_t kSleepEnergyStepSeconds = 5 * 60;
+    static constexpr uint32_t kSleepEnergyStepSeconds = 3 * 60;
     static constexpr uint32_t kMoodStepSeconds = 15 * 60;
 
     PetStateEngine() = default;
@@ -264,8 +300,7 @@ private:
         nvs_handle_t handle = 0;
         const esp_err_t open_err = nvs_open(kNamespace, NVS_READONLY, &handle);
         if (open_err != ESP_OK) {
-            // First boot is expected to have no pet namespace yet.
-            return;
+            return; // First boot: defaults are intentional.
         }
 
         uint8_t version = 0;
@@ -325,16 +360,17 @@ private:
             dirty_ = dirty_ || state_.hunger != before;
         }
 
-        energy_remainder_s_ += elapsed_s;
-        const uint32_t energy_step = state_.sleeping ? kSleepEnergyStepSeconds
-                                                      : kAwakeEnergyStepSeconds;
-        if (energy_remainder_s_ >= energy_step) {
-            const uint32_t steps = energy_remainder_s_ / energy_step;
-            energy_remainder_s_ %= energy_step;
-            const uint8_t before = state_.energy;
-            state_.energy = state_.sleeping ? AddClamp(state_.energy, steps)
-                                             : SubClamp(state_.energy, steps);
-            dirty_ = dirty_ || state_.energy != before;
+        // Energy recovery is strictly sleep-only. Awake elapsed time neither
+        // restores nor drains Energy; Play/minigames are the consumption path.
+        if (state_.sleeping) {
+            energy_remainder_s_ += elapsed_s;
+            if (energy_remainder_s_ >= kSleepEnergyStepSeconds) {
+                const uint32_t steps = energy_remainder_s_ / kSleepEnergyStepSeconds;
+                energy_remainder_s_ %= kSleepEnergyStepSeconds;
+                const uint8_t before = state_.energy;
+                state_.energy = AddClamp(state_.energy, steps);
+                dirty_ = dirty_ || state_.energy != before;
+            }
         }
 
         mood_remainder_s_ += elapsed_s;
@@ -342,7 +378,7 @@ private:
             const uint32_t steps = mood_remainder_s_ / kMoodStepSeconds;
             mood_remainder_s_ %= kMoodStepSeconds;
             const uint8_t before = state_.mood;
-            if (state_.hunger >= 75 || state_.energy <= 25) {
+            if (state_.hunger >= 75 || state_.energy <= 20) {
                 state_.mood = SubClamp(state_.mood, steps);
             } else if (state_.mood < 70) {
                 state_.mood = AddClamp(state_.mood, std::max<uint32_t>(1, steps / 2));
@@ -355,6 +391,16 @@ private:
         const int32_t now_epoch = CurrentValidEpoch();
         if (now_epoch > 0) {
             state_.last_interaction_epoch = now_epoch;
+        }
+    }
+
+    void CheckpointIfDueLocked() {
+        if (!dirty_) {
+            return;
+        }
+        const int64_t now_us = esp_timer_get_time();
+        if (now_us - last_save_monotonic_us_ >= kNormalSaveIntervalUs) {
+            SaveLocked(now_us);
         }
     }
 
