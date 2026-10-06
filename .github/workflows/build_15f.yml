@@ -1,0 +1,196 @@
+name: Build Mochi HUD Play Fix 15F
+
+on:
+  push:
+    branches:
+      - mochi-hud-play-fix-15f
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build Mochi HUD + Play fix 15F
+    runs-on: ubuntu-latest
+    container:
+      image: espressif/idf:v5.5.1
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Restore hardware-PASS task stack sizes
+        shell: bash
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+
+          p = Path('main/application.cc')
+          text = p.read_text(encoding='utf-8')
+          old = '}, "main_event_loop", 1024 * 3 + 512, this, 3, &main_event_loop_task_handle_);'
+          new = '}, "main_event_loop", 2048 * 4, this, 3, &main_event_loop_task_handle_);'
+          if text.count(old) != 1: raise SystemExit('main_event_loop anchor mismatch')
+          p.write_text(text.replace(old, new), encoding='utf-8')
+
+          p = Path('main/audio/audio_service.cc')
+          text = p.read_text(encoding='utf-8')
+          if text.count('}, "audio_input", 1024 * 3, this, 8, &audio_input_task_handle_') != 2:
+              raise SystemExit('audio_input anchor mismatch')
+          if text.count('}, "audio_output", 1024 * 3, this, 4, &audio_output_task_handle_);') != 2:
+              raise SystemExit('audio_output anchor mismatch')
+          text = text.replace('}, "audio_input", 1024 * 3, this, 8, &audio_input_task_handle_, 0);',
+                              '}, "audio_input", 2048 * 3, this, 8, &audio_input_task_handle_, 0);', 1)
+          text = text.replace('}, "audio_output", 1024 * 3, this, 4, &audio_output_task_handle_);',
+                              '}, "audio_output", 2048 * 2, this, 4, &audio_output_task_handle_);', 1)
+          text = text.replace('}, "audio_input", 1024 * 3, this, 8, &audio_input_task_handle_);',
+                              '}, "audio_input", 2048 * 2, this, 8, &audio_input_task_handle_);', 1)
+          text = text.replace('}, "audio_output", 1024 * 3, this, 4, &audio_output_task_handle_);',
+                              '}, "audio_output", 2048, this, 4, &audio_output_task_handle_);', 1)
+          old = '}, "opus_codec", 1024 * 25, this, 2, &opus_codec_task_handle_);'
+          if text.count(old) != 1: raise SystemExit('opus anchor mismatch')
+          text = text.replace(old, '}, "opus_codec", 2048 * 13, this, 2, &opus_codec_task_handle_);', 1)
+          p.write_text(text, encoding='utf-8')
+
+          p = Path('main/audio/wake_words/afe_wake_word.cc')
+          text = p.read_text(encoding='utf-8')
+          old = '}, "audio_detection", 1024 * 3, this, 3, nullptr);'
+          if text.count(old) != 1: raise SystemExit('AFE anchor mismatch')
+          p.write_text(text.replace(old, '}, "audio_detection", 4096, this, 3, nullptr);'), encoding='utf-8')
+          PY
+
+      - name: Keep 15B bootstrap behavior
+        shell: bash
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          p = Path('main/application.cc')
+          text = p.read_text(encoding='utf-8')
+          replacements = [
+              ('const int MAX_RETRY = 10;', 'const int MAX_RETRY = 3;'),
+              ('int retry_delay = 10; // Initial retry delay is 10 seconds', 'int retry_delay = 5; // Mochi bootstrap: bounded retry'),
+              ('retry_delay = 10; // Reset retry delay time', 'retry_delay = 5; // Reset bounded bootstrap retry'),
+              ('display->SetStatus(Lang::Strings::CHECKING_NEW_VERSION);', 'display->SetStatus(Lang::Strings::LOADING_PROTOCOL);'),
+          ]
+          for old,new in replacements:
+              if text.count(old) != 1: raise SystemExit(f'bootstrap anchor mismatch: {old}')
+              text = text.replace(old,new,1)
+          p.write_text(text, encoding='utf-8')
+          PY
+
+      - name: Integrate pet lifecycle into Application idle clock
+        shell: bash
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          p = Path('main/application.cc')
+          text = p.read_text(encoding='utf-8')
+          old = '#include "settings.h"\n#include "ota_server.h"'
+          new = '#include "settings.h"\n#include "pet/pet_state_engine.h"\n#include "ota_server.h"'
+          if text.count(old) != 1: raise SystemExit('pet include anchor mismatch')
+          text = text.replace(old,new,1)
+          anchor = '            display->UpdateStatusBar();'
+          if text.count(anchor) != 1: raise SystemExit('status-bar anchor mismatch')
+          lifecycle = '''            display->UpdateStatusBar();
+
+            if (device_state_ == kDeviceStateIdle && clock_ticks_ % 5 == 0) {
+                PetStateEngine::GetInstance().ServiceIdleLifecycle();
+            }'''
+          p.write_text(text.replace(anchor,lifecycle,1), encoding='utf-8')
+          PY
+
+      - name: Apply 15F HUD and Play fixes
+        shell: bash
+        run: python scripts/patch_mochi_15e.py
+
+      - name: Verify 15F invariants
+        shell: bash
+        run: |
+          H=main/boards/xingzhi-cube-1.83tft-wifi/mochi_lcd_display.h
+          B=main/boards/xingzhi-cube-1.83tft-wifi/xingzhi-cube-1.83tft-wifi.cc
+          P=main/pet/pet_state_engine.h
+          W=main/boards/common/wifi_board.cc
+          O=main/ota.h
+          A=main/application.cc
+
+          grep -n "MOCHI_MENU_LONG_PRESS_MS 1000" "$B"
+          grep -n "kHudWidthPx = 30" "$H"
+          grep -n "kHudRightMarginPx = 9" "$H"
+          grep -n "kHudBottomSafePx = 22" "$H"
+          grep -n "lv_font_montserrat_14" "$H"
+          grep -n "Fullness: bowl with food/steam" "$H"
+          grep -n "Energy: recognizable zig-zag lightning" "$H"
+          grep -n "Mood: outlined smiley" "$H"
+          grep -n "Friendship: cleaner symmetric heart" "$H"
+          grep -n "Coin: ring + small center shine" "$H"
+
+          grep -n "Explicit Play wakes Mochi" "$P"
+          grep -n "return energy_cost > 0 && state_.energy >= energy_cost" "$P"
+          grep -n "state_.manual_sleep = false" "$P"
+          if grep -n "state_.sleeping || energy_cost == 0" "$P"; then
+            echo "Old silent Play sleep rejection still present"; exit 1
+          fi
+
+          grep -n "bool HasNewVersion() { return false; }" "$O"
+          grep -n "Saved WiFi is still unavailable" "$W"
+          grep -n "ServiceIdleLifecycle" "$A"
+          grep -n "state == kDeviceStateSpeaking" "$B"
+          grep -n "app.SetDeviceState(kDeviceStateListening)" "$B"
+
+          if grep -n "boot_button_.OnClick" "$B"; then
+            echo "Talk release-after-long protection regressed"; exit 1
+          fi
+          if grep -n "kHudIcons" "$H"; then
+            echo "Text HUD icons must not return"; exit 1
+          fi
+          if grep -n "xTaskCreatePinnedToCore\|xTaskCreate(" "$H"; then
+            echo "HUD must not add FreeRTOS task"; exit 1
+          fi
+
+      - name: Build firmware
+        shell: bash
+        run: |
+          source $IDF_PATH/export.sh
+          idf.py --version
+          python scripts/release.py xingzhi-cube-1.83tft-wifi --name xingzhi-cube-1.83tft-wifi
+
+      - name: Verify and package APP-only image
+        shell: bash
+        run: |
+          source $IDF_PATH/export.sh
+          set -euo pipefail
+          APP=build/xiaozhi_vn.bin
+          test -f "$APP"
+          APP_SIZE=$(stat -c%s "$APP")
+          APP_LIMIT=$((0x570000))
+          if [ "$APP_SIZE" -ge "$APP_LIMIT" ]; then echo "APP too large"; exit 1; fi
+          echo "APP size: $APP_SIZE / $APP_LIMIT"
+          python -m esptool --chip esp32s3 image_info "$APP"
+          rm -rf flash_package && mkdir flash_package
+          cp "$APP" flash_package/MOCHI_HUD_PLAY_FIX_15F_APP.bin
+          cp build/xiaozhi_vn.elf flash_package/
+          cp build/xiaozhi_vn.map flash_package/
+          (cd flash_package && sha256sum MOCHI_HUD_PLAY_FIX_15F_APP.bin > SHA256.txt)
+          cat > flash_package/FLASH_INSTRUCTIONS.txt <<'EOF'
+          MOCHI HUD + PLAY FIX 15F - APP ONLY
+
+          Baseline: 15E hardware-tested by user; UI/play corrections only.
+          Flash APP at 0x20000. Do NOT erase flash. Assets unchanged.
+
+          python -m esptool --chip esp32s3 --port COM5 --baud 921600 write-flash 0x20000 MOCHI_HUD_PLAY_FIX_15F_APP.bin
+
+          Changes:
+          - Talk menu hold remains 1 second.
+          - HUD remains one narrow vertical column, icon above value.
+          - Values use smaller Montserrat 14 and are pushed lower for visible icon/value separation.
+          - HUD moved slightly further inward and Coin gets more bottom corner clearance.
+          - Custom icons redrawn as clearer outlined LVGL pictograms; no icon font.
+          - Play now wakes logical sleep automatically when Energy is sufficient, then deducts 10 Energy.
+          - CanPlay/CompletePlay use the same rule to prevent future inconsistent behavior.
+          EOF
+
+      - name: Upload APP-only firmware
+        uses: actions/upload-artifact@v4
+        with:
+          name: mochi_hud_play_fix_15f_app_${{ github.sha }}
+          path: flash_package/
+          if-no-files-found: error
+          retention-days: 30
