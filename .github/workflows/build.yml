@@ -115,16 +115,58 @@ jobs:
           source $IDF_PATH/export.sh
           idf.py --version
           python scripts/release.py xingzhi-cube-1.83tft-wifi --name xingzhi-cube-1.83tft-wifi
-          echo 'Debug artifacts:'
-          find build -type f \( -name '*.elf' -o -name '*.map' -o -name 'merged-binary.bin' \) -print || true
 
-      - name: Upload firmware and debug symbols
+      - name: Verify and package APP-only flash image
+        shell: bash
+        run: |
+          source $IDF_PATH/export.sh
+          set -euo pipefail
+          APP=build/xiaozhi_vn.bin
+          test -f "$APP"
+          APP_SIZE=$(stat -c%s "$APP")
+          APP_LIMIT=$((0x570000))
+          if [ "$APP_SIZE" -ge "$APP_LIMIT" ]; then
+            echo "APP too large: $APP_SIZE >= $APP_LIMIT"
+            exit 1
+          fi
+          echo "APP size: $APP_SIZE bytes / partition limit $APP_LIMIT bytes"
+          python -m esptool --chip esp32s3 image-info "$APP"
+
+          rm -rf flash_package
+          mkdir -p flash_package
+          cp "$APP" flash_package/MOCHI_PET_STATE_CORE_15A_APP.bin
+          cp build/xiaozhi_vn.elf flash_package/
+          cp build/xiaozhi_vn.map flash_package/
+          sha256sum flash_package/MOCHI_PET_STATE_CORE_15A_APP.bin | tee flash_package/SHA256.txt
+          cat > flash_package/FLASH_INSTRUCTIONS.txt <<'EOF'
+          MOCHI PET STATE CORE 15A - APP ONLY
+
+          Baseline: Fix14 hardware-PASS
+          Branch: mochi-pet-state-core-15a
+
+          Flash ONLY this APP image at 0x20000.
+          Do NOT erase flash.
+          Do NOT flash merged-binary.bin at 0x0.
+          Assets are unchanged from Fix14.
+
+          Windows example (replace COM5 if needed):
+          python -m esptool --chip esp32s3 --port COM5 --baud 921600 write-flash 0x20000 MOCHI_PET_STATE_CORE_15A_APP.bin
+
+          Hardware smoke test:
+          1. Boot normally; saved Wi-Fi must remain.
+          2. Wait for Mochi/background to settle; no reboot loop.
+          3. Run 10-20 voice Q&A exchanges.
+          4. During TTS press talk: TTS must abort and device must immediately listen.
+          5. Leave idle for several minutes and check normal Fix14 animation/background.
+
+          15A intentionally adds only the hidden pet/economy core. Minigames, food UI,
+          state-aware idle behavior and auto-sleep visuals come in later staged builds.
+          EOF
+
+      - name: Upload APP-only firmware and debug symbols
         uses: actions/upload-artifact@v4
         with:
-          name: mochi_pet_state_core_15a_${{ github.sha }}
-          path: |
-            build/merged-binary.bin
-            build/**/*.elf
-            build/**/*.map
+          name: mochi_pet_state_core_15a_app_${{ github.sha }}
+          path: flash_package/
           if-no-files-found: error
           retention-days: 30
