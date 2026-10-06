@@ -130,7 +130,7 @@ jobs:
             exit 1
           fi
           echo "APP size: $APP_SIZE bytes / partition limit $APP_LIMIT bytes"
-          python -m esptool --chip esp32s3 image-info "$APP"
+          python -m esptool --chip esp32s3 image_info "$APP"
 
           rm -rf flash_package
           mkdir -p flash_package
