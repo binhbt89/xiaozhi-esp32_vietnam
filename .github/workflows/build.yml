@@ -1,16 +1,16 @@
-name: Build Mochi Pet State Core 15A
+name: Build Mochi Pet Runtime Foundation 15B
 
 on:
   push:
     branches:
-      - mochi-pet-state-core-15a
+      - mochi-pet-runtime-foundation-15b
 
 permissions:
   contents: read
 
 jobs:
   build:
-    name: Build Mochi pet state core 15A
+    name: Build Mochi pet runtime foundation 15B
     runs-on: ubuntu-latest
     container:
       image: espressif/idf:v5.5.1
@@ -71,6 +71,36 @@ jobs:
           p.write_text(text.replace(old, new), encoding='utf-8')
           PY
 
+      - name: Make bootstrap bounded and non-misleading
+        shell: bash
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          p = Path('main/application.cc')
+          text = p.read_text(encoding='utf-8')
+
+          old = 'const int MAX_RETRY = 10;'
+          if text.count(old) != 1:
+              raise SystemExit(f'{p}: MAX_RETRY pattern count={text.count(old)}')
+          text = text.replace(old, 'const int MAX_RETRY = 3;', 1)
+
+          old = 'int retry_delay = 10; // Initial retry delay is 10 seconds'
+          if text.count(old) != 1:
+              raise SystemExit(f'{p}: initial retry delay pattern count={text.count(old)}')
+          text = text.replace(old, 'int retry_delay = 5; // Mochi bootstrap: bounded retry', 1)
+
+          old = 'retry_delay = 10; // Reset retry delay time'
+          if text.count(old) != 1:
+              raise SystemExit(f'{p}: reset retry delay pattern count={text.count(old)}')
+          text = text.replace(old, 'retry_delay = 5; // Reset bounded bootstrap retry', 1)
+
+          old = 'display->SetStatus(Lang::Strings::CHECKING_NEW_VERSION);'
+          if text.count(old) != 1:
+              raise SystemExit(f'{p}: checking-version status pattern count={text.count(old)}')
+          text = text.replace(old, 'display->SetStatus(Lang::Strings::LOADING_PROTOCOL);', 1)
+          p.write_text(text, encoding='utf-8')
+          PY
+
       - name: Verify stable talk-button barge-in patch
         shell: bash
         run: |
@@ -92,18 +122,31 @@ jobs:
             exit 1
           fi
 
-      - name: Verify Pet State Core 15A architecture
+      - name: Verify 15B OTA WiFi and pet foundations
         shell: bash
         run: |
           P=main/pet/pet_state_engine.h
-          B=main/boards/xingzhi-cube-1.83tft-wifi/xingzhi-cube-1.83tft-wifi.cc
-          grep -n "class PetStateEngine" "$P"
-          grep -n "int32_t coins = 50" "$P"
-          grep -n "bool Feed" "$P"
-          grep -n "CompletePlay" "$P"
-          grep -n "ShouldAutoSleep" "$P"
-          grep -n "PetStateEngine::GetInstance().Initialize" "$B"
-          grep -n "PetStateEngine::GetInstance().SaveNow" "$B"
+          W=main/boards/common/wifi_board.cc
+          O=main/ota.h
+          A=main/application.cc
+
+          grep -n "bool HasNewVersion() { return false; }" "$O"
+          grep -n "while (!wifi_station.WaitForConnected(60 \* 1000))" "$W"
+          grep -n "Saved WiFi is still unavailable" "$W"
+          grep -n "bool Play(uint8_t energy_cost = 10" "$P"
+          grep -n "kSleepEnergyStepSeconds = 3 \* 60" "$P"
+          grep -n "Energy recovery is strictly sleep-only" "$P"
+          grep -n "const int MAX_RETRY = 3" "$A"
+          grep -n "Lang::Strings::LOADING_PROTOCOL" "$A"
+
+          if grep -n "kAwakeEnergyStepSeconds" "$P"; then
+            echo "Awake Energy decay must stay disabled in 15B"
+            exit 1
+          fi
+          if grep -n "wifi_station.Stop();" "$W"; then
+            echo "Saved WiFi must not be stopped after a startup timeout"
+            exit 1
+          fi
           if grep -nE "xTaskCreate|lv_|esp_sntp|http|websocket" "$P"; then
             echo "Pet core must not own tasks, LVGL, SNTP, or network work"
             exit 1
@@ -134,15 +177,15 @@ jobs:
 
           rm -rf flash_package
           mkdir -p flash_package
-          cp "$APP" flash_package/MOCHI_PET_STATE_CORE_15A_APP.bin
+          cp "$APP" flash_package/MOCHI_PET_RUNTIME_FOUNDATION_15B_APP.bin
           cp build/xiaozhi_vn.elf flash_package/
           cp build/xiaozhi_vn.map flash_package/
-          sha256sum flash_package/MOCHI_PET_STATE_CORE_15A_APP.bin | tee flash_package/SHA256.txt
+          sha256sum flash_package/MOCHI_PET_RUNTIME_FOUNDATION_15B_APP.bin | tee flash_package/SHA256.txt
           cat > flash_package/FLASH_INSTRUCTIONS.txt <<'EOF'
-          MOCHI PET STATE CORE 15A - APP ONLY
+          MOCHI PET RUNTIME FOUNDATION 15B - APP ONLY
 
-          Baseline: Fix14 hardware-PASS
-          Branch: mochi-pet-state-core-15a
+          Baseline: Pet State Core 15A hardware-PASS, itself based on Fix14 hardware-PASS.
+          Branch: mochi-pet-runtime-foundation-15b
 
           Flash ONLY this APP image at 0x20000.
           Do NOT erase flash.
@@ -150,23 +193,33 @@ jobs:
           Assets are unchanged from Fix14.
 
           Windows example (replace COM5 if needed):
-          python -m esptool --chip esp32s3 --port COM5 --baud 921600 write-flash 0x20000 MOCHI_PET_STATE_CORE_15A_APP.bin
+          python -m esptool --chip esp32s3 --port COM5 --baud 921600 write-flash 0x20000 MOCHI_PET_RUNTIME_FOUNDATION_15B_APP.bin
+
+          15B foundation changes:
+          - Server bootstrap remains for MQTT/WebSocket/activation/time, but server-driven firmware auto-upgrade is disabled.
+          - Bootstrap UI no longer says "checking new version"; retries are bounded to 3 with 5/10/20-second backoff.
+          - If saved Wi-Fi is unavailable at boot, Station mode remains alive and keeps reconnecting/rescanning instead of entering AP config after 60 seconds.
+          - Energy never regenerates while awake. Logical Sleep restores +1 Energy every 3 minutes.
+          - Sleep/Wake boundaries are persisted immediately for correct offline sleep recovery.
+          - Basic Play API: -10 Energy, +Mood/+Friendship, no minigame yet.
+          - Current ESP32 screen has no touch/on-screen Play control; physical Talk/Vol buttons are intentionally unchanged.
 
           Hardware smoke test:
-          1. Boot normally; saved Wi-Fi must remain.
-          2. Wait for Mochi/background to settle; no reboot loop.
+          1. Flash APP-only without erase; saved Wi-Fi must remain.
+          2. Boot normally and verify no reboot loop/Guru Meditation.
           3. Run 10-20 voice Q&A exchanges.
-          4. During TTS press talk: TTS must abort and device must immediately listen.
-          5. Leave idle for several minutes and check normal Fix14 animation/background.
+          4. During TTS press Talk: TTS must abort and device must immediately listen.
+          5. Leave idle several minutes: Fix14 animation/background must remain unchanged.
+          6. Wi-Fi resilience: boot with the saved router OFF for >60 seconds, then turn it ON. Mochi must connect automatically without reboot or AP-config takeover.
+          7. Confirm startup does not auto-install an upstream firmware.
 
-          15A intentionally adds only the hidden pet/economy core. Minigames, food UI,
-          state-aware idle behavior and auto-sleep visuals come in later staged builds.
+          Pet Play/Sleep backend is included now; UI/minigame controls will be connected in a later staged build after this foundation passes hardware testing.
           EOF
 
       - name: Upload APP-only firmware and debug symbols
         uses: actions/upload-artifact@v4
         with:
-          name: mochi_pet_state_core_15a_app_${{ github.sha }}
+          name: mochi_pet_runtime_foundation_15b_app_${{ github.sha }}
           path: flash_package/
           if-no-files-found: error
           retention-days: 30
