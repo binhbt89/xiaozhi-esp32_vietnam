@@ -16,8 +16,10 @@
 #include "assets/lang_config.h"
 #include "power_manager.h"
 
+#include <atomic>
 #include <esp_log.h>
 #include <esp_lcd_panel_vendor.h>
+#include <esp_timer.h>
 #include <wifi_station.h>
 
 #include <driver/rtc_io.h>
@@ -25,17 +27,24 @@
 
 #define TAG "XINGZHI_CUBE_1_83TFT_WIFI_MOCHI"
 #define MOCHI_BACKLIGHT_PERCENT 25
+#define MOCHI_MENU_LONG_PRESS_MS 2000
 
 class XINGZHI_CUBE_1_54TFT_WIFI : public WifiBoard {
 private:
     Button boot_button_;
     Button volume_up_button_;
     Button volume_down_button_;
-    Mochi183LcdDisplay* display_;
+    Mochi183LcdDisplay* display_ = nullptr;
     PowerSaveTimer* power_save_timer_;
     PowerManager* power_manager_;
     esp_lcd_panel_io_handle_t panel_io_ = nullptr;
     esp_lcd_panel_handle_t panel_ = nullptr;
+
+    // Talk uses PressDown/PressUp plus the component's real 2-second long-press
+    // event. This deliberately avoids registering OnClick, so releasing after a
+    // menu long-press can never accidentally start a voice transaction.
+    std::atomic<int64_t> talk_press_started_us_{0};
+    std::atomic_bool talk_long_press_consumed_{false};
 
     void InitializePowerManager() {
         power_manager_ = new PowerManager(GPIO_NUM_38);
@@ -64,9 +73,6 @@ private:
         });
         power_save_timer_->OnShutdownRequest([this]() {
             ESP_LOGI(TAG, "Shutting down");
-            // Controlled shutdown is a safe place for a pet-state checkpoint.
-            // SaveNow() is a no-op when nothing changed, so normal flash wear
-            // remains negligible.
             PetStateEngine::GetInstance().SaveNow();
             rtc_gpio_set_level(GPIO_NUM_21, 0);
             rtc_gpio_hold_en(GPIO_NUM_21);
@@ -87,41 +93,102 @@ private:
         ESP_ERROR_CHECK(spi_bus_initialize(SPI3_HOST, &buscfg, SPI_DMA_CH_AUTO));
     }
 
-    void InitializeButtons() {
-        boot_button_.OnClick([this]() {
-            power_save_timer_->WakeUp();
-            auto& app = Application::GetInstance();
+    void HandleTalkShortPress() {
+        power_save_timer_->WakeUp();
+        auto& app = Application::GetInstance();
+        const auto state = app.GetDeviceState();
 
-            // The stock board code erased WiFi settings if this button was
-            // pressed while startup WiFi was temporarily disconnected. With a
-            // weak signal that can look like a random reboot into WiFi setup.
-            // Never reset credentials from the normal talk button.
-            if (app.GetDeviceState() == kDeviceStateStarting) {
-                ESP_LOGW(TAG, "Talk button ignored while startup/network init is still running");
-                return;
-            }
+        // Never reset credentials from the normal talk/menu button.
+        if (state == kDeviceStateStarting) {
+            ESP_LOGW(TAG, "Talk button ignored while startup/network init is still running");
+            return;
+        }
 
-            // Keep the radio awake during the voice transaction. This improves
-            // websocket/audio stability on marginal WiFi at a small power cost.
+        // Voice has priority over menu. If a conversation is already speaking,
+        // preserve the hardware-PASS barge-in behavior exactly.
+        if (state == kDeviceStateSpeaking) {
             WifiStation::GetInstance().SetPowerSaveMode(false);
+            app.Schedule([&app]() {
+                app.AbortSpeaking(kAbortReasonNone);
+                app.SetDeviceState(kDeviceStateListening);
+            });
+            return;
+        }
 
-            // A normal ToggleChatState() only sends AbortSpeaking while the
-            // assistant is talking; it does NOT transition back to listening.
-            // For this board the expected UX is barge-in: one click interrupts
-            // TTS and immediately resumes the same listening mode (AutoStop or
-            // Realtime) that the current conversation is already using.
-            if (app.GetDeviceState() == kDeviceStateSpeaking) {
-                app.Schedule([&app]() {
-                    app.AbortSpeaking(kAbortReasonNone);
-                    app.SetDeviceState(kDeviceStateListening);
-                });
+        // While Idle and menu is open, Talk short means Select/OK rather than
+        // starting voice. The menu itself auto-closes if voice becomes active.
+        if (state == kDeviceStateIdle && display_ != nullptr && display_->IsMenuOpen()) {
+            display_->RequestMenuSelect();
+            return;
+        }
+
+        WifiStation::GetInstance().SetPowerSaveMode(false);
+        app.ToggleChatState();
+    }
+
+    void HandleTalkLongPress() {
+        power_save_timer_->WakeUp();
+        auto& app = Application::GetInstance();
+        const auto state = app.GetDeviceState();
+
+        if (state == kDeviceStateStarting) {
+            ESP_LOGW(TAG, "Talk long-press ignored while startup/network init is running");
+            return;
+        }
+
+        // Menu is only an Idle interaction. During listening/speaking, Talk
+        // remains a voice control so a menu gesture can never steal barge-in.
+        if (state == kDeviceStateIdle && display_ != nullptr) {
+            display_->RequestMenuToggle();
+            return;
+        }
+
+        HandleTalkShortPress();
+    }
+
+    bool HandleMenuMoveIfOpen(int delta) {
+        if (display_ == nullptr || !display_->IsMenuOpen()) {
+            return false;
+        }
+        if (Application::GetInstance().GetDeviceState() != kDeviceStateIdle) {
+            return false;
+        }
+        power_save_timer_->WakeUp();
+        display_->RequestMenuMove(delta);
+        return true;
+    }
+
+    void InitializeButtons() {
+        boot_button_.OnPressDown([this]() {
+            power_save_timer_->WakeUp();
+            talk_press_started_us_.store(esp_timer_get_time());
+            talk_long_press_consumed_.store(false);
+        });
+
+        boot_button_.OnLongPress([this]() {
+            talk_long_press_consumed_.store(true);
+            HandleTalkLongPress();
+        });
+
+        boot_button_.OnPressUp([this]() {
+            const int64_t started = talk_press_started_us_.exchange(0);
+            const bool consumed = talk_long_press_consumed_.exchange(false);
+            if (consumed) {
                 return;
             }
 
-            app.ToggleChatState();
+            // Defensive fallback: if a very long release races the component's
+            // long-press callback, treat it as a menu long-press, never a click.
+            const int64_t held_us = started > 0 ? (esp_timer_get_time() - started) : 0;
+            if (held_us >= static_cast<int64_t>(MOCHI_MENU_LONG_PRESS_MS) * 1000) {
+                HandleTalkLongPress();
+                return;
+            }
+            HandleTalkShortPress();
         });
 
         volume_up_button_.OnClick([this]() {
+            if (HandleMenuMoveIfOpen(-1)) return;
             power_save_timer_->WakeUp();
             auto codec = GetAudioCodec();
             auto volume = codec->output_volume() + 10;
@@ -131,12 +198,14 @@ private:
         });
 
         volume_up_button_.OnLongPress([this]() {
+            if (HandleMenuMoveIfOpen(-1)) return;
             power_save_timer_->WakeUp();
             GetAudioCodec()->SetOutputVolume(100);
             GetDisplay()->ShowNotification(Lang::Strings::MAX_VOLUME);
         });
 
         volume_down_button_.OnClick([this]() {
+            if (HandleMenuMoveIfOpen(1)) return;
             power_save_timer_->WakeUp();
             auto codec = GetAudioCodec();
             auto volume = codec->output_volume() - 10;
@@ -146,6 +215,7 @@ private:
         });
 
         volume_down_button_.OnLongPress([this]() {
+            if (HandleMenuMoveIfOpen(1)) return;
             power_save_timer_->WakeUp();
             GetAudioCodec()->SetOutputVolume(0);
             GetDisplay()->ShowNotification(Lang::Strings::MUTED);
@@ -183,7 +253,7 @@ private:
 
 public:
     XINGZHI_CUBE_1_54TFT_WIFI() :
-        boot_button_(BOOT_BUTTON_GPIO),
+        boot_button_(BOOT_BUTTON_GPIO, false, MOCHI_MENU_LONG_PRESS_MS, 50),
         volume_up_button_(VOLUME_UP_BUTTON_GPIO),
         volume_down_button_(VOLUME_DOWN_BUTTON_GPIO) {
         InitializePowerManager();
