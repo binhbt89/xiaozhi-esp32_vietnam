@@ -1,16 +1,16 @@
-name: Build Mochi Pet Behavior V1 15C
+name: Build Mochi HUD Menu Foundation 15D
 
 on:
   push:
     branches:
-      - mochi-pet-behavior-v1-15c
+      - mochi-hud-menu-foundation-15d
 
 permissions:
   contents: read
 
 jobs:
   build:
-    name: Build Mochi pet behavior V1 15C
+    name: Build Mochi HUD menu foundation 15D
     runs-on: ubuntu-latest
     container:
       image: espressif/idf:v5.5.1
@@ -130,16 +130,13 @@ jobs:
           p.write_text(text, encoding='utf-8')
           PY
 
-      - name: Verify stable talk-button barge-in patch
+      - name: Verify Fix14 voice animation baseline
         shell: bash
         run: |
-          grep -n "app.GetDeviceState() == kDeviceStateSpeaking" main/boards/xingzhi-cube-1.83tft-wifi/xingzhi-cube-1.83tft-wifi.cc
-          grep -n "app.SetDeviceState(kDeviceStateListening)" main/boards/xingzhi-cube-1.83tft-wifi/xingzhi-cube-1.83tft-wifi.cc
-
-      - name: Verify Fix14 animation and lighting baseline
-        shell: bash
-        run: |
+          B=main/boards/xingzhi-cube-1.83tft-wifi/xingzhi-cube-1.83tft-wifi.cc
           H=main/boards/xingzhi-cube-1.83tft-wifi/mochi_lcd_display.h
+          grep -n "app.GetDeviceState() == kDeviceStateSpeaking\|state == kDeviceStateSpeaking" "$B"
+          grep -n "app.SetDeviceState(kDeviceStateListening)" "$B"
           grep -n "kAmbientTimerMs = 200" "$H"
           grep -n "kMoveStepPx = 5" "$H"
           grep -n "positions\[\] = {-50, -25, 0, 25, 50}" "$H"
@@ -154,46 +151,79 @@ jobs:
       - name: Verify 15B OTA and WiFi baseline
         shell: bash
         run: |
-          P=main/pet/pet_state_engine.h
           W=main/boards/common/wifi_board.cc
           O=main/ota.h
           A=main/application.cc
-
           grep -n "bool HasNewVersion() { return false; }" "$O"
           grep -n "while (!wifi_station.WaitForConnected(60 \* 1000))" "$W"
           grep -n "Saved WiFi is still unavailable" "$W"
           grep -n "const int MAX_RETRY = 3" "$A"
           grep -n "Lang::Strings::LOADING_PROTOCOL" "$A"
-
           if grep -n "wifi_station.Stop();" "$W"; then
             echo "Saved WiFi must not be stopped after a startup timeout"
             exit 1
           fi
 
-      - name: Verify Pet Behavior V1 15C architecture
+      - name: Verify 15C pet lifecycle baseline
         shell: bash
         run: |
           P=main/pet/pet_state_engine.h
-          H=main/boards/xingzhi-cube-1.83tft-wifi/mochi_lcd_display.h
           A=main/application.cc
-
           grep -n "bool manual_sleep = false" "$P"
           grep -n "LifecycleTransition ServiceIdleLifecycle" "$P"
           grep -n "kAutoWakeEnergy = 90" "$P"
           grep -n "ServiceIdleLifecycle" "$A"
-          grep -n "pet.sleeping" "$H"
-          grep -n "pet.energy <= 35" "$H"
-          grep -n "pet.hunger >= 75" "$H"
-          grep -n "pet.mood >= 80" "$H"
-          grep -n "pet.friendship >= 60" "$H"
-
           if grep -nE "xTaskCreate|lv_|esp_sntp|http|websocket" "$P"; then
             echo "Pet core must not own tasks, LVGL, SNTP, or network work"
             exit 1
           fi
 
-          if grep -nE "\.Sleep\(|\.Wake\(|SaveNow\(|ServiceIdleLifecycle" "$H"; then
-            echo "LVGL layer must be read-only with respect to persistent pet state"
+      - name: Verify HUD Menu Foundation 15D
+        shell: bash
+        run: |
+          P=main/pet/pet_state_engine.h
+          H=main/boards/xingzhi-cube-1.83tft-wifi/mochi_lcd_display.h
+          B=main/boards/xingzhi-cube-1.83tft-wifi/xingzhi-cube-1.83tft-wifi.cc
+
+          grep -n "uint8_t fullness = 84" "$P"
+          grep -n "kSchemaVersion = 2" "$P"
+          grep -n "kLegacySchemaVersion = 1" "$P"
+          grep -n "kMaxStat = 99" "$P"
+          grep -n "kMaxCoins = 999" "$P"
+          grep -n "Migrating pet NVS v1 Hunger -> v2 Fullness" "$P"
+          grep -n "state_.fullness = SubClamp" "$P"
+
+          grep -n "kHudWidthPx = 38" "$H"
+          grep -n "StatusBarHeightLvgl" "$H"
+          grep -n "CreateHudLvgl" "$H"
+          grep -n "LV_HOR_RES - kHudWidthPx - kHudRightMarginPx" "$H"
+          grep -n "RefreshHudLvgl" "$H"
+          grep -n "RequestMenuToggle" "$H"
+          grep -n "RequestMenuMove" "$H"
+          grep -n "RequestMenuSelect" "$H"
+          grep -n "Application::GetInstance().Schedule" "$H"
+          grep -n "Voice always wins" "$H"
+
+          grep -n "MOCHI_MENU_LONG_PRESS_MS 2000" "$B"
+          grep -n "boot_button_(BOOT_BUTTON_GPIO, false, MOCHI_MENU_LONG_PRESS_MS, 50)" "$B"
+          grep -n "boot_button_.OnPressDown" "$B"
+          grep -n "boot_button_.OnLongPress" "$B"
+          grep -n "boot_button_.OnPressUp" "$B"
+          grep -n "HandleMenuMoveIfOpen(-1)" "$B"
+          grep -n "HandleMenuMoveIfOpen(1)" "$B"
+
+          # Talk short is intentionally implemented through PressUp; registering
+          # SINGLE_CLICK again would risk release-after-long launching voice.
+          if grep -n "boot_button_.OnClick" "$B"; then
+            echo "15D Talk must not register OnClick"
+            exit 1
+          fi
+          if grep -n "pet.hunger\|state_.hunger" "$H" "$P"; then
+            echo "Legacy inverse Hunger semantics leaked into 15D"
+            exit 1
+          fi
+          if grep -n "xTaskCreatePinnedToCore\|xTaskCreate(" "$H"; then
+            echo "15D UI must not add a FreeRTOS task"
             exit 1
           fi
 
@@ -222,50 +252,52 @@ jobs:
 
           rm -rf flash_package
           mkdir -p flash_package
-          cp "$APP" flash_package/MOCHI_PET_BEHAVIOR_V1_15C_APP.bin
+          cp "$APP" flash_package/MOCHI_HUD_MENU_FOUNDATION_15D_APP.bin
           cp build/xiaozhi_vn.elf flash_package/
           cp build/xiaozhi_vn.map flash_package/
-          sha256sum flash_package/MOCHI_PET_BEHAVIOR_V1_15C_APP.bin | tee flash_package/SHA256.txt
+          (cd flash_package && sha256sum MOCHI_HUD_MENU_FOUNDATION_15D_APP.bin > SHA256.txt)
           cat > flash_package/FLASH_INSTRUCTIONS.txt <<'EOF'
-          MOCHI PET BEHAVIOR V1 15C - APP ONLY
+          MOCHI HUD + MENU FOUNDATION 15D - APP ONLY
 
-          Baseline: Runtime Foundation 15B hardware-PASS.
-          Branch: mochi-pet-behavior-v1-15c
+          Baseline: Pet Behavior V1 15C hardware-PASS.
+          Branch: mochi-hud-menu-foundation-15d
 
           Flash ONLY this APP image at 0x20000.
           Do NOT erase flash.
           Do NOT flash merged-binary.bin at 0x0.
-          Assets are unchanged from Fix14/15B.
+          Assets are unchanged from Fix14/15B/15C.
 
           Windows example (replace COM5 if needed):
-          python -m esptool --chip esp32s3 --port COM5 --baud 921600 write-flash 0x20000 MOCHI_PET_BEHAVIOR_V1_15C_APP.bin
+          python -m esptool --chip esp32s3 --port COM5 --baud 921600 write-flash 0x20000 MOCHI_HUD_MENU_FOUNDATION_15D_APP.bin
 
-          15C changes:
-          - Hunger/Energy/Mood/Friendship now bias existing idle behavior.
-          - Logical sleeping forces ambient_sleep while Application is Idle.
-          - Voice remains higher priority; animation pauses during listening/speaking and resumes after idle settle.
-          - Auto sleep at Energy <=20, auto wake at Energy >=90.
-          - Manual Sleep is separately persisted and never auto-wakes.
-          - Pet lifecycle/NVS service runs on Application main loop every 5 idle seconds, never in LVGL timer.
-          - No new assets, tasks, touch UI, minigames, or physical-button remapping.
+          15D changes:
+          - Main-screen right HUD starts below the existing status bar.
+          - Fullness/Energy/Mood/Friendship are 00..99; Coin is 000..999.
+          - NVS v1 Hunger is migrated once to intuitive v2 Fullness (0 hungry, 99 full).
+          - Hold Talk for 2 seconds while Idle to open/close the overlay menu.
+          - Menu controls: Vol+ up, Vol- down, Talk short Select/OK.
+          - Menu V1 actions: Pet, Play (-10 Energy), Sleep/Wake, Close.
+          - Voice has higher priority than menu and closes menu when voice activates.
+          - Talk short outside menu preserves the 15C voice/barge-in behavior.
+          - Menu/HUD LVGL mutation stays on the existing 200ms LVGL timer; no new task.
+          - Pet state mutations selected in menu are scheduled to Application/main context.
 
-          Hardware regression test:
-          1. APP-only flash without erase; Wi-Fi/NVS must remain.
-          2. Boot normally; no reboot loop/Guru Meditation.
-          3. Run 10-20 voice Q&A exchanges.
-          4. Interrupt TTS with Talk; it must immediately listen.
-          5. Leave idle 15-30 minutes and verify background/movement stay smooth.
-          6. Repeat 15B Wi-Fi outage recovery test if convenient.
-
-          State-specific behavior uses the existing animation set, so the main
-          purpose of this build is to validate that state-aware reads and the
-          5-second lifecycle service do not affect voice/LVGL stability.
+          Hardware test focus:
+          1. APP-only flash without erase; Wi-Fi and pet NVS must remain.
+          2. Verify top Wi-Fi/device/battery status bar is unobstructed.
+          3. Verify the right HUD is readable and does not cover Mochi.
+          4. Hold Talk ~2s: menu opens. Release must NOT start voice.
+          5. Vol+/Vol- move selection; Talk short selects.
+          6. Close menu, then Talk short starts voice normally.
+          7. During TTS, Talk short must still abort speech and immediately listen.
+          8. Play should reduce Energy by 10 on the HUD; Sleep/Wake should update behavior.
+          9. Run 10-20 voice exchanges and leave idle 15-30 min; no reboot/Guru Meditation.
           EOF
 
       - name: Upload APP-only firmware and debug symbols
         uses: actions/upload-artifact@v4
         with:
-          name: mochi_pet_behavior_v1_15c_app_${{ github.sha }}
+          name: mochi_hud_menu_foundation_15d_app_${{ github.sha }}
           path: flash_package/
           if-no-files-found: error
           retention-days: 30
