@@ -15,11 +15,11 @@
 class PetStateEngine {
 public:
     struct Snapshot {
-        uint8_t hunger = 15;      // 0 = full, 100 = very hungry
-        uint8_t energy = 80;      // 0 = exhausted, 100 = rested
-        uint8_t mood = 70;        // internal behavior bias
-        uint8_t friendship = 10;  // long-term relationship, does not decay
-        int32_t coins = 50;       // future minigame/food economy
+        uint8_t fullness = 84;    // 0 = starving, 99 = full
+        uint8_t energy = 80;      // 0 = exhausted, 99 = rested
+        uint8_t mood = 70;        // 0 = sad, 99 = very happy
+        uint8_t friendship = 10;  // 0 = new, 99 = closest
+        int32_t coins = 50;       // 0..999 in-game currency
         bool sleeping = false;
         bool manual_sleep = false;
         int32_t last_interaction_epoch = 0;
@@ -55,9 +55,18 @@ public:
         // until CurrentValidEpoch() becomes trustworthy later in normal runtime.
         TryReconcileOfflineSleepLocked();
 
+        // Schema v1 stored inverse Hunger (0 full -> 100 hungry). 15D changes
+        // that user-facing concept to intuitive Fullness (0 hungry -> 99 full).
+        // Persist the one-time migration immediately so later boots are simple.
+        if (migration_pending_) {
+            dirty_ = true;
+            SaveLocked(last_monotonic_us_);
+            migration_pending_ = false;
+        }
+
         ESP_LOGI(kTag,
-                 "Pet core ready H=%u E=%u M=%u F=%u coins=%ld sleep=%d manual=%d",
-                 state_.hunger, state_.energy, state_.mood, state_.friendship,
+                 "Pet core ready Full=%u E=%u M=%u F=%u coins=%ld sleep=%d manual=%d",
+                 state_.fullness, state_.energy, state_.mood, state_.friendship,
                  static_cast<long>(state_.coins), state_.sleeping ? 1 : 0,
                  state_.manual_sleep ? 1 : 0);
     }
@@ -75,7 +84,7 @@ public:
         UpdateRuntimeLocked();
     }
 
-    bool Feed(int32_t price, uint8_t hunger_relief, uint8_t mood_bonus = 3) {
+    bool Feed(int32_t price, uint8_t fullness_gain, uint8_t mood_bonus = 3) {
         std::lock_guard<std::mutex> lock(mutex_);
         EnsureInitializedLocked();
         UpdateRuntimeLocked();
@@ -83,7 +92,7 @@ public:
             return false;
         }
         state_.coins -= price;
-        state_.hunger = SubClamp(state_.hunger, hunger_relief);
+        state_.fullness = AddClamp(state_.fullness, fullness_gain);
         state_.mood = AddClamp(state_.mood, mood_bonus);
         state_.friendship = AddClamp(state_.friendship, 1);
         state_.sleeping = false;
@@ -109,7 +118,7 @@ public:
 
         state_.energy = SubClamp(state_.energy, energy_cost);
         state_.mood = AddClamp(state_.mood, mood_bonus);
-        state_.hunger = AddClamp(state_.hunger, 2);
+        state_.fullness = SubClamp(state_.fullness, 2);
         state_.friendship = AddClamp(state_.friendship, 1);
         TouchInteractionLocked();
         dirty_ = true;
@@ -127,9 +136,9 @@ public:
         return !state_.sleeping && energy_cost > 0 && state_.energy >= energy_cost;
     }
 
-    // Future minigames call this only after their gameplay succeeds.
+    // Future minigames call this only after their own gameplay succeeds.
     void CompletePlay(int32_t coin_reward, uint8_t mood_bonus = 10,
-                      uint8_t energy_cost = 15, uint8_t hunger_cost = 3) {
+                      uint8_t energy_cost = 15, uint8_t fullness_cost = 3) {
         std::lock_guard<std::mutex> lock(mutex_);
         EnsureInitializedLocked();
         UpdateRuntimeLocked();
@@ -141,7 +150,7 @@ public:
         }
         state_.mood = AddClamp(state_.mood, mood_bonus);
         state_.energy = SubClamp(state_.energy, energy_cost);
-        state_.hunger = AddClamp(state_.hunger, hunger_cost);
+        state_.fullness = SubClamp(state_.fullness, fullness_cost);
         state_.friendship = AddClamp(state_.friendship, 2);
         TouchInteractionLocked();
         dirty_ = true;
@@ -231,8 +240,6 @@ public:
         return price >= 0 && state_.coins >= price;
     }
 
-    // Safe lazy checkpoint for non-critical state changes. No flash write occurs
-    // unless the state is dirty and at least ten minutes passed since last save.
     bool MaybeSave() {
         std::lock_guard<std::mutex> lock(mutex_);
         EnsureInitializedLocked();
@@ -262,18 +269,20 @@ public:
 private:
     static constexpr const char* kTag = "MochiPet";
     static constexpr const char* kNamespace = "mochi_pet";
-    static constexpr uint8_t kSchemaVersion = 1;
+    static constexpr uint8_t kSchemaVersion = 2;
+    static constexpr uint8_t kLegacySchemaVersion = 1;
     static constexpr int32_t kValidEpochThreshold = 1704067200; // 2024-01-01
     static constexpr int32_t kMaxOfflineSimulationSeconds = 12 * 60 * 60;
     static constexpr int64_t kNormalSaveIntervalUs = 10LL * 60 * 1000 * 1000;
-    static constexpr int32_t kMaxCoins = 999999;
+    static constexpr uint8_t kMaxStat = 99;
+    static constexpr int32_t kMaxCoins = 999;
     static constexpr uint8_t kAutoSleepEnergy = 20;
     static constexpr uint8_t kAutoWakeEnergy = 90;
 
-    // Hunger changes gently. Energy never changes merely because Mochi is
-    // awake: activities spend it, and only logical Sleep restores it slowly.
-    static constexpr uint32_t kAwakeHungerStepSeconds = 12 * 60;
-    static constexpr uint32_t kSleepHungerStepSeconds = 20 * 60;
+    // Fullness gently falls over time. Energy never changes merely because
+    // Mochi is awake: activities spend it, and only logical Sleep restores it.
+    static constexpr uint32_t kAwakeFullnessStepSeconds = 12 * 60;
+    static constexpr uint32_t kSleepFullnessStepSeconds = 20 * 60;
     static constexpr uint32_t kSleepEnergyStepSeconds = 3 * 60;
     static constexpr uint32_t kMoodStepSeconds = 15 * 60;
 
@@ -283,16 +292,17 @@ private:
     std::mutex mutex_;
     bool initialized_ = false;
     bool dirty_ = false;
+    bool migration_pending_ = false;
     bool offline_sleep_reconciled_ = false;
     int32_t last_update_epoch_ = 0;
     int64_t last_monotonic_us_ = 0;
     int64_t last_save_monotonic_us_ = 0;
-    uint32_t hunger_remainder_s_ = 0;
+    uint32_t fullness_remainder_s_ = 0;
     uint32_t energy_remainder_s_ = 0;
     uint32_t mood_remainder_s_ = 0;
 
     static uint8_t AddClamp(uint8_t value, uint32_t amount) {
-        return static_cast<uint8_t>(std::min<uint32_t>(100, value + amount));
+        return static_cast<uint8_t>(std::min<uint32_t>(kMaxStat, value + amount));
     }
 
     static uint8_t SubClamp(uint8_t value, uint32_t amount) {
@@ -316,14 +326,19 @@ private:
         last_save_monotonic_us_ = last_monotonic_us_;
         initialized_ = true;
         TryReconcileOfflineSleepLocked();
+        if (migration_pending_) {
+            dirty_ = true;
+            SaveLocked(last_monotonic_us_);
+            migration_pending_ = false;
+        }
     }
 
     static uint32_t PackStats(const Snapshot& s) {
         uint32_t packed = 0;
-        packed |= static_cast<uint32_t>(std::min<uint8_t>(100, s.hunger));
-        packed |= static_cast<uint32_t>(std::min<uint8_t>(100, s.energy)) << 7;
-        packed |= static_cast<uint32_t>(std::min<uint8_t>(100, s.mood)) << 14;
-        packed |= static_cast<uint32_t>(std::min<uint8_t>(100, s.friendship)) << 21;
+        packed |= static_cast<uint32_t>(std::min<uint8_t>(kMaxStat, s.fullness));
+        packed |= static_cast<uint32_t>(std::min<uint8_t>(kMaxStat, s.energy)) << 7;
+        packed |= static_cast<uint32_t>(std::min<uint8_t>(kMaxStat, s.mood)) << 14;
+        packed |= static_cast<uint32_t>(std::min<uint8_t>(kMaxStat, s.friendship)) << 21;
         if (s.sleeping) {
             packed |= (1u << 28);
         }
@@ -333,11 +348,21 @@ private:
         return packed;
     }
 
-    static void UnpackStats(uint32_t packed, Snapshot& s) {
-        s.hunger = static_cast<uint8_t>(std::min<uint32_t>(100, packed & 0x7F));
-        s.energy = static_cast<uint8_t>(std::min<uint32_t>(100, (packed >> 7) & 0x7F));
-        s.mood = static_cast<uint8_t>(std::min<uint32_t>(100, (packed >> 14) & 0x7F));
-        s.friendship = static_cast<uint8_t>(std::min<uint32_t>(100, (packed >> 21) & 0x7F));
+    static void UnpackStatsV2(uint32_t packed, Snapshot& s) {
+        s.fullness = static_cast<uint8_t>(std::min<uint32_t>(kMaxStat, packed & 0x7F));
+        s.energy = static_cast<uint8_t>(std::min<uint32_t>(kMaxStat, (packed >> 7) & 0x7F));
+        s.mood = static_cast<uint8_t>(std::min<uint32_t>(kMaxStat, (packed >> 14) & 0x7F));
+        s.friendship = static_cast<uint8_t>(std::min<uint32_t>(kMaxStat, (packed >> 21) & 0x7F));
+        s.sleeping = ((packed >> 28) & 0x01) != 0;
+        s.manual_sleep = s.sleeping && (((packed >> 29) & 0x01) != 0);
+    }
+
+    static void UnpackStatsV1(uint32_t packed, Snapshot& s) {
+        const uint8_t old_hunger = static_cast<uint8_t>(std::min<uint32_t>(kMaxStat, packed & 0x7F));
+        s.fullness = static_cast<uint8_t>(kMaxStat - old_hunger);
+        s.energy = static_cast<uint8_t>(std::min<uint32_t>(kMaxStat, (packed >> 7) & 0x7F));
+        s.mood = static_cast<uint8_t>(std::min<uint32_t>(kMaxStat, (packed >> 14) & 0x7F));
+        s.friendship = static_cast<uint8_t>(std::min<uint32_t>(kMaxStat, (packed >> 21) & 0x7F));
         s.sleeping = ((packed >> 28) & 0x01) != 0;
         s.manual_sleep = s.sleeping && (((packed >> 29) & 0x01) != 0);
     }
@@ -355,15 +380,25 @@ private:
         int32_t last_interaction = 0;
         int32_t last_update = 0;
 
-        const bool valid =
+        const bool header_valid =
             nvs_get_u8(handle, "ver", &version) == ESP_OK &&
-            version == kSchemaVersion &&
             nvs_get_u32(handle, "stats", &packed) == ESP_OK;
 
-        if (valid) {
-            UnpackStats(packed, state_);
+        if (header_valid && (version == kSchemaVersion || version == kLegacySchemaVersion)) {
+            if (version == kLegacySchemaVersion) {
+                UnpackStatsV1(packed, state_);
+                migration_pending_ = true;
+                ESP_LOGI(kTag, "Migrating pet NVS v1 Hunger -> v2 Fullness");
+            } else {
+                UnpackStatsV2(packed, state_);
+            }
+
             if (nvs_get_i32(handle, "coins", &coins) == ESP_OK) {
-                state_.coins = std::clamp<int32_t>(coins, 0, kMaxCoins);
+                const int32_t clamped = std::clamp<int32_t>(coins, 0, kMaxCoins);
+                state_.coins = clamped;
+                if (clamped != coins) {
+                    migration_pending_ = true;
+                }
             }
             if (nvs_get_i32(handle, "last_int", &last_interaction) == ESP_OK) {
                 state_.last_interaction_epoch = last_interaction;
@@ -394,8 +429,7 @@ private:
             elapsed = std::min<int32_t>(elapsed, kMaxOfflineSimulationSeconds);
 
             // Only sleep Energy is reconciled across reboot. This deliberately
-            // avoids punishing hunger/mood when server-time and SNTP timezone
-            // semantics differ in the upstream firmware.
+            // avoids punishing Fullness/Mood when upstream time semantics differ.
             energy_remainder_s_ += static_cast<uint32_t>(elapsed);
             if (energy_remainder_s_ >= kSleepEnergyStepSeconds) {
                 const uint32_t steps = energy_remainder_s_ / kSleepEnergyStepSeconds;
@@ -432,15 +466,15 @@ private:
             return;
         }
 
-        const uint32_t hunger_step = state_.sleeping ? kSleepHungerStepSeconds
-                                                      : kAwakeHungerStepSeconds;
-        hunger_remainder_s_ += elapsed_s;
-        if (hunger_remainder_s_ >= hunger_step) {
-            const uint32_t steps = hunger_remainder_s_ / hunger_step;
-            hunger_remainder_s_ %= hunger_step;
-            const uint8_t before = state_.hunger;
-            state_.hunger = AddClamp(state_.hunger, steps);
-            dirty_ = dirty_ || state_.hunger != before;
+        const uint32_t fullness_step = state_.sleeping ? kSleepFullnessStepSeconds
+                                                        : kAwakeFullnessStepSeconds;
+        fullness_remainder_s_ += elapsed_s;
+        if (fullness_remainder_s_ >= fullness_step) {
+            const uint32_t steps = fullness_remainder_s_ / fullness_step;
+            fullness_remainder_s_ %= fullness_step;
+            const uint8_t before = state_.fullness;
+            state_.fullness = SubClamp(state_.fullness, steps);
+            dirty_ = dirty_ || state_.fullness != before;
         }
 
         // Energy recovery is strictly sleep-only. Awake elapsed time neither
@@ -461,7 +495,7 @@ private:
             const uint32_t steps = mood_remainder_s_ / kMoodStepSeconds;
             mood_remainder_s_ %= kMoodStepSeconds;
             const uint8_t before = state_.mood;
-            if (state_.hunger >= 75 || state_.energy <= 20) {
+            if (state_.fullness <= 24 || state_.energy <= 20) {
                 state_.mood = SubClamp(state_.mood, steps);
             } else if (state_.mood < 70) {
                 state_.mood = AddClamp(state_.mood, std::max<uint32_t>(1, steps / 2));
