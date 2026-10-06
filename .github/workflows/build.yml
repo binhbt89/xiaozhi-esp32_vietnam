@@ -1,16 +1,16 @@
-name: Build Mochi Pet Runtime Foundation 15B
+name: Build Mochi Pet Behavior V1 15C
 
 on:
   push:
     branches:
-      - mochi-pet-runtime-foundation-15b
+      - mochi-pet-behavior-v1-15c
 
 permissions:
   contents: read
 
 jobs:
   build:
-    name: Build Mochi pet runtime foundation 15B
+    name: Build Mochi pet behavior V1 15C
     runs-on: ubuntu-latest
     container:
       image: espressif/idf:v5.5.1
@@ -71,7 +71,7 @@ jobs:
           p.write_text(text.replace(old, new), encoding='utf-8')
           PY
 
-      - name: Make bootstrap bounded and non-misleading
+      - name: Keep 15B bootstrap behavior
         shell: bash
         run: |
           python - <<'PY'
@@ -101,6 +101,45 @@ jobs:
           p.write_text(text, encoding='utf-8')
           PY
 
+      - name: Integrate pet lifecycle into Application idle clock
+        shell: bash
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          p = Path('main/application.cc')
+          text = p.read_text(encoding='utf-8')
+
+          old = '#include "settings.h"\n#include "ota_server.h"'
+          new = '#include "settings.h"\n#include "pet/pet_state_engine.h"\n#include "ota_server.h"'
+          if text.count(old) != 1:
+              raise SystemExit(f'{p}: pet include anchor count={text.count(old)}')
+          text = text.replace(old, new, 1)
+
+          old = '''        if (bits & MAIN_EVENT_CLOCK_TICK) {
+            clock_ticks_++;
+            auto display = Board::GetInstance().GetDisplay();
+            display->UpdateStatusBar();
+        
+            // Print the debug info every 10 seconds'''
+          new = '''        if (bits & MAIN_EVENT_CLOCK_TICK) {
+            clock_ticks_++;
+            auto display = Board::GetInstance().GetDisplay();
+            display->UpdateStatusBar();
+
+            // Pet lifecycle work belongs on the Application main loop, never
+            // the 200ms LVGL timer. Every five idle seconds is ample for state
+            // drift, auto sleep/wake, and coalesced NVS checkpoints.
+            if (device_state_ == kDeviceStateIdle && clock_ticks_ % 5 == 0) {
+                PetStateEngine::GetInstance().ServiceIdleLifecycle();
+            }
+        
+            // Print the debug info every 10 seconds'''
+          if text.count(old) != 1:
+              raise SystemExit(f'{p}: clock lifecycle anchor count={text.count(old)}')
+          text = text.replace(old, new, 1)
+          p.write_text(text, encoding='utf-8')
+          PY
+
       - name: Verify stable talk-button barge-in patch
         shell: bash
         run: |
@@ -122,7 +161,7 @@ jobs:
             exit 1
           fi
 
-      - name: Verify 15B OTA WiFi and pet foundations
+      - name: Verify 15B OTA and WiFi baseline
         shell: bash
         run: |
           P=main/pet/pet_state_engine.h
@@ -133,22 +172,41 @@ jobs:
           grep -n "bool HasNewVersion() { return false; }" "$O"
           grep -n "while (!wifi_station.WaitForConnected(60 \* 1000))" "$W"
           grep -n "Saved WiFi is still unavailable" "$W"
-          grep -n "bool Play(uint8_t energy_cost = 10" "$P"
-          grep -n "kSleepEnergyStepSeconds = 3 \* 60" "$P"
-          grep -n "Energy recovery is strictly sleep-only" "$P"
           grep -n "const int MAX_RETRY = 3" "$A"
           grep -n "Lang::Strings::LOADING_PROTOCOL" "$A"
 
-          if grep -n "kAwakeEnergyStepSeconds" "$P"; then
-            echo "Awake Energy decay must stay disabled in 15B"
-            exit 1
-          fi
           if grep -n "wifi_station.Stop();" "$W"; then
             echo "Saved WiFi must not be stopped after a startup timeout"
             exit 1
           fi
+
+      - name: Verify Pet Behavior V1 15C architecture
+        shell: bash
+        run: |
+          P=main/pet/pet_state_engine.h
+          H=main/boards/xingzhi-cube-1.83tft-wifi/mochi_lcd_display.h
+          A=main/application.cc
+
+          grep -n "bool manual_sleep = false" "$P"
+          grep -n "LifecycleTransition ServiceIdleLifecycle" "$P"
+          grep -n "kAutoWakeEnergy = 90" "$P"
+          grep -n "ServiceIdleLifecycle" "$A"
+          grep -n "pet.sleeping" "$H"
+          grep -n "pet.energy <= 35" "$H"
+          grep -n "pet.hunger >= 75" "$H"
+          grep -n "pet.mood >= 80" "$H"
+          grep -n "pet.friendship >= 60" "$H"
+
+          # Pet core remains logic/persistence only.
           if grep -nE "xTaskCreate|lv_|esp_sntp|http|websocket" "$P"; then
             echo "Pet core must not own tasks, LVGL, SNTP, or network work"
+            exit 1
+          fi
+
+          # Persistent lifecycle may write NVS only from Application main loop;
+          # the LVGL display layer must never call Sleep/Wake/Save methods.
+          if grep -nE "\.Sleep\(|\.Wake\(|SaveNow\(|ServiceIdleLifecycle" "$H"; then
+            echo "LVGL layer must be read-only with respect to persistent pet state"
             exit 1
           fi
 
@@ -177,49 +235,50 @@ jobs:
 
           rm -rf flash_package
           mkdir -p flash_package
-          cp "$APP" flash_package/MOCHI_PET_RUNTIME_FOUNDATION_15B_APP.bin
+          cp "$APP" flash_package/MOCHI_PET_BEHAVIOR_V1_15C_APP.bin
           cp build/xiaozhi_vn.elf flash_package/
           cp build/xiaozhi_vn.map flash_package/
-          sha256sum flash_package/MOCHI_PET_RUNTIME_FOUNDATION_15B_APP.bin | tee flash_package/SHA256.txt
+          sha256sum flash_package/MOCHI_PET_BEHAVIOR_V1_15C_APP.bin | tee flash_package/SHA256.txt
           cat > flash_package/FLASH_INSTRUCTIONS.txt <<'EOF'
-          MOCHI PET RUNTIME FOUNDATION 15B - APP ONLY
+          MOCHI PET BEHAVIOR V1 15C - APP ONLY
 
-          Baseline: Pet State Core 15A hardware-PASS, itself based on Fix14 hardware-PASS.
-          Branch: mochi-pet-runtime-foundation-15b
+          Baseline: Runtime Foundation 15B hardware-PASS.
+          Branch: mochi-pet-behavior-v1-15c
 
           Flash ONLY this APP image at 0x20000.
           Do NOT erase flash.
           Do NOT flash merged-binary.bin at 0x0.
-          Assets are unchanged from Fix14.
+          Assets are unchanged from Fix14/15B.
 
           Windows example (replace COM5 if needed):
-          python -m esptool --chip esp32s3 --port COM5 --baud 921600 write-flash 0x20000 MOCHI_PET_RUNTIME_FOUNDATION_15B_APP.bin
+          python -m esptool --chip esp32s3 --port COM5 --baud 921600 write-flash 0x20000 MOCHI_PET_BEHAVIOR_V1_15C_APP.bin
 
-          15B foundation changes:
-          - Server bootstrap remains for MQTT/WebSocket/activation/time, but server-driven firmware auto-upgrade is disabled.
-          - Bootstrap UI no longer says "checking new version"; retries are bounded to 3 with 5/10/20-second backoff.
-          - If saved Wi-Fi is unavailable at boot, Station mode remains alive and keeps reconnecting/rescanning instead of entering AP config after 60 seconds.
-          - Energy never regenerates while awake. Logical Sleep restores +1 Energy every 3 minutes.
-          - Sleep/Wake boundaries are persisted immediately for correct offline sleep recovery.
-          - Basic Play API: -10 Energy, +Mood/+Friendship, no minigame yet.
-          - Current ESP32 screen has no touch/on-screen Play control; physical Talk/Vol buttons are intentionally unchanged.
+          15C changes:
+          - Hunger/Energy/Mood/Friendship now bias existing idle behavior.
+          - Logical sleeping forces ambient_sleep while Application is Idle.
+          - Voice remains higher priority; animation pauses during listening/speaking and resumes after idle settle.
+          - Auto sleep at Energy <=20, auto wake at Energy >=90.
+          - Manual Sleep is separately persisted and never auto-wakes.
+          - Pet lifecycle/NVS service runs on Application main loop every 5 idle seconds, never in LVGL timer.
+          - No new assets, tasks, touch UI, minigames, or physical-button remapping.
 
-          Hardware smoke test:
-          1. Flash APP-only without erase; saved Wi-Fi must remain.
-          2. Boot normally and verify no reboot loop/Guru Meditation.
-          3. Run 10-20 voice Q&A exchanges.
-          4. During TTS press Talk: TTS must abort and device must immediately listen.
-          5. Leave idle several minutes: Fix14 animation/background must remain unchanged.
-          6. Wi-Fi resilience: boot with the saved router OFF for >60 seconds, then turn it ON. Mochi must connect automatically without reboot or AP-config takeover.
-          7. Confirm startup does not auto-install an upstream firmware.
+          Hardware regression test:
+          1. APP-only flash without erase; Wi-Fi/NVS must remain.
+          2. Boot normally; no reboot loop/Guru Meditation.
+          3. 10-20 voice Q&A exchanges.
+          4. Interrupt TTS with Talk; it must immediately listen.
+          5. Leave idle 15-30 minutes and verify background/movement stay smooth.
+          6. Repeat 15B Wi-Fi outage recovery test if convenient.
 
-          Pet Play/Sleep backend is included now; UI/minigame controls will be connected in a later staged build after this foundation passes hardware testing.
+          State-specific behavior uses the existing animation set, so the main
+          purpose of this build is to validate that state-aware reads and the
+          5-second lifecycle service do not affect voice/LVGL stability.
           EOF
 
       - name: Upload APP-only firmware and debug symbols
         uses: actions/upload-artifact@v4
         with:
-          name: mochi_pet_runtime_foundation_15b_app_${{ github.sha }}
+          name: mochi_pet_behavior_v1_15c_app_${{ github.sha }}
           path: flash_package/
           if-no-files-found: error
           retention-days: 30
