@@ -1,16 +1,16 @@
-name: Build Mochi Animation Light Fix 14
+name: Build Mochi Pet State Core 15A
 
 on:
   push:
     branches:
-      - mochi-animation-light-fix-14
+      - mochi-pet-state-core-15a
 
 permissions:
   contents: read
 
 jobs:
   build:
-    name: Build Mochi animation light Fix14
+    name: Build Mochi pet state core 15A
     runs-on: ubuntu-latest
     container:
       image: espressif/idf:v5.5.1
@@ -77,7 +77,7 @@ jobs:
           grep -n "app.GetDeviceState() == kDeviceStateSpeaking" main/boards/xingzhi-cube-1.83tft-wifi/xingzhi-cube-1.83tft-wifi.cc
           grep -n "app.SetDeviceState(kDeviceStateListening)" main/boards/xingzhi-cube-1.83tft-wifi/xingzhi-cube-1.83tft-wifi.cc
 
-      - name: Verify Fix14 animation and lighting code
+      - name: Verify Fix14 animation and lighting baseline
         shell: bash
         run: |
           H=main/boards/xingzhi-cube-1.83tft-wifi/mochi_lcd_display.h
@@ -89,6 +89,23 @@ jobs:
           grep -n "kIdleSettleTicks" "$H"
           if grep -n "xTaskCreatePinnedToCore" "$H"; then
             echo "Unexpected dedicated ambient FreeRTOS task remains"
+            exit 1
+          fi
+
+      - name: Verify Pet State Core 15A architecture
+        shell: bash
+        run: |
+          P=main/pet/pet_state_engine.h
+          B=main/boards/xingzhi-cube-1.83tft-wifi/xingzhi-cube-1.83tft-wifi.cc
+          grep -n "class PetStateEngine" "$P"
+          grep -n "int32_t coins = 50" "$P"
+          grep -n "bool Feed" "$P"
+          grep -n "CompletePlay" "$P"
+          grep -n "ShouldAutoSleep" "$P"
+          grep -n "PetStateEngine::GetInstance().Initialize" "$B"
+          grep -n "PetStateEngine::GetInstance().SaveNow" "$B"
+          if grep -nE "xTaskCreate|lv_|esp_sntp|http|websocket" "$P"; then
+            echo "Pet core must not own tasks, LVGL, SNTP, or network work"
             exit 1
           fi
 
@@ -104,7 +121,7 @@ jobs:
       - name: Upload firmware and debug symbols
         uses: actions/upload-artifact@v4
         with:
-          name: mochi_animation_light_fix14_${{ github.sha }}
+          name: mochi_pet_state_core_15a_${{ github.sha }}
           path: |
             build/merged-binary.bin
             build/**/*.elf
