@@ -238,7 +238,7 @@ std::string WifiBoard::GetDeviceStatusJson() {
     bool discharging = false;
     if (board.GetBatteryLevel(battery_level, charging, discharging)) {
         cJSON* battery = cJSON_CreateObject();
-        cJSON_AddNumberToObject(battery, "level", level);
+        cJSON_AddNumberToObject(battery, "level", battery_level);
         cJSON_AddBoolToObject(battery, "charging", charging);
         cJSON_AddItemToObject(root, "battery", battery);
     }
