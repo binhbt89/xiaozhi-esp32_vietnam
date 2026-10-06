@@ -12,7 +12,9 @@
 #include <esp_sntp.h>
 
 #include <algorithm>
+#include <array>
 #include <atomic>
+#include <cstdio>
 #include <cstring>
 #include <cstdlib>
 #include <ctime>
@@ -29,6 +31,14 @@ private:
         Night
     };
 
+    enum class PetMenuItem : uint8_t {
+        Pet = 0,
+        Play,
+        SleepWake,
+        Close,
+        Count
+    };
+
     static constexpr const char* kAmbientTag = "MochiAmbient";
     static constexpr time_t kValidEpochThreshold = 1704067200;
     static constexpr int kVietnamUtcOffsetSeconds = 7 * 60 * 60;
@@ -36,6 +46,12 @@ private:
     static constexpr uint32_t kIdleSettleTicks = 25;          // 5 seconds
     static constexpr uint32_t kBackgroundReapplyTicks = 300; // 60 seconds
     static constexpr int kMoveStepPx = 5;
+    static constexpr int kHudWidthPx = 38;
+    static constexpr int kHudRightMarginPx = 2;
+    static constexpr int kHudTopGapPx = 2;
+    static constexpr uint32_t kHudRefreshTicks = 5;           // 1 second
+    static constexpr size_t kHudRowCount = 5;
+    static constexpr size_t kMenuItemCount = static_cast<size_t>(PetMenuItem::Count);
 
     lv_obj_t* mochi_chat_bubble_ = nullptr;
     lv_obj_t* mochi_chat_label_ = nullptr;
@@ -43,6 +59,25 @@ private:
     lv_obj_t* night_glow_ = nullptr;
     lv_obj_t* night_floor_glow_ = nullptr;
     lv_timer_t* ambient_timer_ = nullptr;
+
+    // 15D HUD: a narrow vertical strip on the right. It is created on the
+    // screen (not container_) so background replacement can never overwrite it.
+    lv_obj_t* hud_panel_ = nullptr;
+    std::array<lv_obj_t*, kHudRowCount> hud_value_labels_{};
+    std::array<int, kHudRowCount> hud_last_values_{{-1, -1, -1, -1, -1}};
+    uint32_t hud_refresh_ticks_ = 0;
+
+    // 15D menu: button callbacks only post atomic requests. All LVGL object
+    // mutation remains inside AmbientTickLvgl(), preserving the Fix14 model.
+    lv_obj_t* menu_overlay_ = nullptr;
+    lv_obj_t* menu_card_ = nullptr;
+    std::array<lv_obj_t*, kMenuItemCount> menu_rows_{};
+    std::array<lv_obj_t*, kMenuItemCount> menu_row_labels_{};
+    uint8_t menu_selected_ = 0;
+    std::atomic_bool menu_open_{false};
+    std::atomic_bool menu_toggle_requested_{false};
+    std::atomic_int menu_move_requested_{0};
+    std::atomic_bool menu_select_requested_{false};
 
     std::shared_ptr<LvglCBinImage> active_background_;
     AmbientPeriod ambient_period_ = AmbientPeriod::Unknown;
@@ -73,6 +108,15 @@ private:
             case AmbientPeriod::Night: return "background_night.raw";
             default: return nullptr;
         }
+    }
+
+    int StatusBarHeightLvgl() const {
+        if (status_bar_ == nullptr) {
+            return 24;
+        }
+        lv_obj_update_layout(status_bar_);
+        const int h = lv_obj_get_height(status_bar_);
+        return (h >= 16 && h <= 48) ? h : 24;
     }
 
     void RequestSntpFallback() {
@@ -187,6 +231,247 @@ private:
         lv_obj_add_flag(night_floor_glow_, LV_OBJ_FLAG_HIDDEN);
     }
 
+    void CreateHudLvgl(lv_obj_t* screen) {
+        const int status_h = StatusBarHeightLvgl();
+        const int panel_h = std::max(150, static_cast<int>(LV_VER_RES) - status_h - 4);
+
+        hud_panel_ = lv_obj_create(screen);
+        lv_obj_set_size(hud_panel_, kHudWidthPx, panel_h);
+        lv_obj_set_pos(hud_panel_, LV_HOR_RES - kHudWidthPx - kHudRightMarginPx,
+                       status_h + kHudTopGapPx);
+        lv_obj_set_style_radius(hud_panel_, 9, 0);
+        lv_obj_set_style_bg_color(hud_panel_, lv_color_hex(0x17202A), 0);
+        lv_obj_set_style_bg_opa(hud_panel_, static_cast<lv_opa_t>(116), 0);
+        lv_obj_set_style_border_width(hud_panel_, 0, 0);
+        lv_obj_set_style_pad_all(hud_panel_, 2, 0);
+        lv_obj_set_style_pad_row(hud_panel_, 0, 0);
+        lv_obj_set_flex_flow(hud_panel_, LV_FLEX_FLOW_COLUMN);
+        lv_obj_set_flex_align(hud_panel_, LV_FLEX_ALIGN_SPACE_EVENLY,
+                              LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+        lv_obj_set_scrollbar_mode(hud_panel_, LV_SCROLLBAR_MODE_OFF);
+        lv_obj_clear_flag(hud_panel_, LV_OBJ_FLAG_SCROLLABLE);
+        lv_obj_clear_flag(hud_panel_, LV_OBJ_FLAG_CLICKABLE);
+
+        // Tiny text badges are used instead of new bitmap/font assets. They are
+        // intentionally language-light and fit a 38px strip: N=no/fullness,
+        // +=Energy, :)=Mood, <3=Friendship, $=Coin.
+        static const char* kHudIcons[kHudRowCount] = {"N", "+", ":)", "<3", "$"};
+        for (size_t i = 0; i < kHudRowCount; ++i) {
+            lv_obj_t* row = lv_obj_create(hud_panel_);
+            lv_obj_set_size(row, 34, 34);
+            lv_obj_set_style_bg_opa(row, LV_OPA_TRANSP, 0);
+            lv_obj_set_style_border_width(row, 0, 0);
+            lv_obj_set_style_pad_all(row, 0, 0);
+            lv_obj_set_scrollbar_mode(row, LV_SCROLLBAR_MODE_OFF);
+            lv_obj_clear_flag(row, LV_OBJ_FLAG_SCROLLABLE);
+            lv_obj_clear_flag(row, LV_OBJ_FLAG_CLICKABLE);
+
+            lv_obj_t* icon = lv_label_create(row);
+            lv_label_set_text(icon, kHudIcons[i]);
+            lv_obj_set_style_text_color(icon, lv_color_hex(0xFFD98A), 0);
+            lv_obj_align(icon, LV_ALIGN_TOP_MID, 0, -1);
+
+            hud_value_labels_[i] = lv_label_create(row);
+            lv_label_set_text(hud_value_labels_[i], i == 4 ? "000" : "00");
+            lv_obj_set_style_text_color(hud_value_labels_[i], lv_color_white(), 0);
+            lv_obj_align(hud_value_labels_[i], LV_ALIGN_BOTTOM_MID, 0, 1);
+        }
+
+        lv_obj_move_foreground(hud_panel_);
+    }
+
+    void RefreshHudLvgl(bool force = false) {
+        if (hud_panel_ == nullptr) return;
+        const auto pet = PetStateEngine::GetInstance().GetSnapshot();
+        const std::array<int, kHudRowCount> values = {
+            static_cast<int>(pet.fullness),
+            static_cast<int>(pet.energy),
+            static_cast<int>(pet.mood),
+            static_cast<int>(pet.friendship),
+            static_cast<int>(pet.coins)
+        };
+
+        char buf[8];
+        for (size_t i = 0; i < values.size(); ++i) {
+            if (!force && hud_last_values_[i] == values[i]) continue;
+            hud_last_values_[i] = values[i];
+            if (i == 4) {
+                std::snprintf(buf, sizeof(buf), "%03d", std::clamp(values[i], 0, 999));
+            } else {
+                std::snprintf(buf, sizeof(buf), "%02d", std::clamp(values[i], 0, 99));
+            }
+            if (hud_value_labels_[i] != nullptr) {
+                lv_label_set_text(hud_value_labels_[i], buf);
+            }
+        }
+        lv_obj_move_foreground(hud_panel_);
+    }
+
+    void CreateMenuLvgl(lv_obj_t* screen) {
+        const int status_h = StatusBarHeightLvgl();
+        menu_overlay_ = lv_obj_create(screen);
+        lv_obj_set_pos(menu_overlay_, 0, status_h);
+        lv_obj_set_size(menu_overlay_, LV_HOR_RES, LV_VER_RES - status_h);
+        lv_obj_set_style_radius(menu_overlay_, 0, 0);
+        lv_obj_set_style_bg_color(menu_overlay_, lv_color_black(), 0);
+        lv_obj_set_style_bg_opa(menu_overlay_, static_cast<lv_opa_t>(92), 0);
+        lv_obj_set_style_border_width(menu_overlay_, 0, 0);
+        lv_obj_set_style_pad_all(menu_overlay_, 0, 0);
+        lv_obj_set_scrollbar_mode(menu_overlay_, LV_SCROLLBAR_MODE_OFF);
+        lv_obj_clear_flag(menu_overlay_, LV_OBJ_FLAG_SCROLLABLE);
+        lv_obj_clear_flag(menu_overlay_, LV_OBJ_FLAG_CLICKABLE);
+
+        menu_card_ = lv_obj_create(menu_overlay_);
+        lv_obj_set_size(menu_card_, 174, 166);
+        lv_obj_align(menu_card_, LV_ALIGN_CENTER, -8, 0);
+        lv_obj_set_style_radius(menu_card_, 14, 0);
+        lv_obj_set_style_bg_color(menu_card_, lv_color_hex(0x17202A), 0);
+        lv_obj_set_style_bg_opa(menu_card_, static_cast<lv_opa_t>(220), 0);
+        lv_obj_set_style_border_width(menu_card_, 1, 0);
+        lv_obj_set_style_border_color(menu_card_, lv_color_hex(0x7F8C8D), 0);
+        lv_obj_set_style_pad_all(menu_card_, 8, 0);
+        lv_obj_set_style_pad_row(menu_card_, 4, 0);
+        lv_obj_set_flex_flow(menu_card_, LV_FLEX_FLOW_COLUMN);
+        lv_obj_set_flex_align(menu_card_, LV_FLEX_ALIGN_START,
+                              LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+        lv_obj_set_scrollbar_mode(menu_card_, LV_SCROLLBAR_MODE_OFF);
+
+        lv_obj_t* title = lv_label_create(menu_card_);
+        lv_label_set_text(title, "MOCHI");
+        lv_obj_set_style_text_color(title, lv_color_hex(0xFFD98A), 0);
+
+        for (size_t i = 0; i < kMenuItemCount; ++i) {
+            menu_rows_[i] = lv_obj_create(menu_card_);
+            lv_obj_set_size(menu_rows_[i], 148, 27);
+            lv_obj_set_style_radius(menu_rows_[i], 7, 0);
+            lv_obj_set_style_border_width(menu_rows_[i], 0, 0);
+            lv_obj_set_style_pad_all(menu_rows_[i], 4, 0);
+            lv_obj_set_scrollbar_mode(menu_rows_[i], LV_SCROLLBAR_MODE_OFF);
+            lv_obj_clear_flag(menu_rows_[i], LV_OBJ_FLAG_SCROLLABLE);
+            lv_obj_clear_flag(menu_rows_[i], LV_OBJ_FLAG_CLICKABLE);
+
+            menu_row_labels_[i] = lv_label_create(menu_rows_[i]);
+            lv_obj_set_style_text_color(menu_row_labels_[i], lv_color_white(), 0);
+            lv_obj_align(menu_row_labels_[i], LV_ALIGN_LEFT_MID, 2, 0);
+        }
+
+        lv_obj_add_flag(menu_overlay_, LV_OBJ_FLAG_HIDDEN);
+        menu_open_.store(false);
+    }
+
+    void UpdateMenuRowsLvgl() {
+        if (menu_overlay_ == nullptr) return;
+        const auto pet = PetStateEngine::GetInstance().GetSnapshot();
+        const char* texts[kMenuItemCount] = {
+            "Pet",
+            "Play (-10 E)",
+            pet.sleeping ? "Wake" : "Sleep",
+            "Close"
+        };
+
+        for (size_t i = 0; i < kMenuItemCount; ++i) {
+            if (menu_row_labels_[i] != nullptr) {
+                char line[32];
+                std::snprintf(line, sizeof(line), "%s %s", i == menu_selected_ ? ">" : " ", texts[i]);
+                lv_label_set_text(menu_row_labels_[i], line);
+            }
+            if (menu_rows_[i] != nullptr) {
+                if (i == menu_selected_) {
+                    lv_obj_set_style_bg_color(menu_rows_[i], lv_color_hex(0x3B536B), 0);
+                    lv_obj_set_style_bg_opa(menu_rows_[i], static_cast<lv_opa_t>(190), 0);
+                } else {
+                    lv_obj_set_style_bg_opa(menu_rows_[i], LV_OPA_TRANSP, 0);
+                }
+            }
+        }
+    }
+
+    void OpenMenuLvgl() {
+        if (menu_overlay_ == nullptr) return;
+        menu_selected_ = 0;
+        UpdateMenuRowsLvgl();
+        lv_obj_remove_flag(menu_overlay_, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_move_foreground(menu_overlay_);
+        menu_open_.store(true);
+        action_ticks_left_ = 8;
+    }
+
+    void CloseMenuLvgl() {
+        if (menu_overlay_ != nullptr) {
+            lv_obj_add_flag(menu_overlay_, LV_OBJ_FLAG_HIDDEN);
+        }
+        menu_open_.store(false);
+        menu_move_requested_.store(0);
+        menu_select_requested_.store(false);
+        idle_stable_ticks_ = 0;
+    }
+
+    void SelectMenuItemLvgl() {
+        const PetMenuItem item = static_cast<PetMenuItem>(menu_selected_);
+        const auto pet = PetStateEngine::GetInstance().GetSnapshot();
+        CloseMenuLvgl();
+
+        // Persistent pet mutations are scheduled onto Application/main context.
+        // The LVGL 200ms timer only decides which command was selected.
+        Application::GetInstance().Schedule([item, was_sleeping = pet.sleeping]() {
+            auto& engine = PetStateEngine::GetInstance();
+            switch (item) {
+                case PetMenuItem::Pet:
+                    engine.Pet();
+                    break;
+                case PetMenuItem::Play:
+                    engine.Play();
+                    break;
+                case PetMenuItem::SleepWake:
+                    if (was_sleeping) engine.Wake();
+                    else engine.Sleep();
+                    break;
+                case PetMenuItem::Close:
+                case PetMenuItem::Count:
+                    break;
+            }
+        });
+    }
+
+    void ProcessMenuRequestsLvgl() {
+        const auto state = Application::GetInstance().GetDeviceState();
+
+        // Voice always wins. A conversation closes the menu immediately rather
+        // than allowing navigation to steal Talk/volume input.
+        if (state != kDeviceStateIdle) {
+            menu_toggle_requested_.store(false);
+            menu_move_requested_.store(0);
+            menu_select_requested_.store(false);
+            if (menu_open_.load()) CloseMenuLvgl();
+            return;
+        }
+
+        if (menu_toggle_requested_.exchange(false)) {
+            if (menu_open_.load()) CloseMenuLvgl();
+            else OpenMenuLvgl();
+        }
+
+        if (!menu_open_.load()) {
+            menu_move_requested_.store(0);
+            menu_select_requested_.store(false);
+            return;
+        }
+
+        const int move = menu_move_requested_.exchange(0);
+        if (move != 0) {
+            int next = static_cast<int>(menu_selected_) + move;
+            const int count = static_cast<int>(kMenuItemCount);
+            next %= count;
+            if (next < 0) next += count;
+            menu_selected_ = static_cast<uint8_t>(next);
+            UpdateMenuRowsLvgl();
+        }
+
+        if (menu_select_requested_.exchange(false)) {
+            SelectMenuItemLvgl();
+        }
+    }
+
     void ApplyMochiLayout() {
         if (!Lock(1000)) return;
 
@@ -205,7 +490,8 @@ private:
         CreateAmbientObjects(screen);
 
         mochi_chat_bubble_ = lv_obj_create(screen);
-        lv_obj_set_width(mochi_chat_bubble_, 236);
+        // Leave a clean right margin for the always-visible 15D HUD.
+        lv_obj_set_width(mochi_chat_bubble_, 220);
         lv_obj_set_height(mochi_chat_bubble_, LV_SIZE_CONTENT);
         lv_obj_set_style_radius(mochi_chat_bubble_, 12, 0);
         lv_obj_set_style_bg_color(mochi_chat_bubble_, lv_color_hex(0xF8F7F2), 0);
@@ -218,10 +504,10 @@ private:
         lv_obj_set_style_pad_top(mochi_chat_bubble_, 7, 0);
         lv_obj_set_style_pad_bottom(mochi_chat_bubble_, 7, 0);
         lv_obj_set_scrollbar_mode(mochi_chat_bubble_, LV_SCROLLBAR_MODE_OFF);
-        lv_obj_align(mochi_chat_bubble_, LV_ALIGN_TOP_MID, 0, 48);
+        lv_obj_align(mochi_chat_bubble_, LV_ALIGN_TOP_MID, -10, 48);
 
         mochi_chat_label_ = lv_label_create(mochi_chat_bubble_);
-        lv_obj_set_width(mochi_chat_label_, 214);
+        lv_obj_set_width(mochi_chat_label_, 198);
         lv_label_set_long_mode(mochi_chat_label_, LV_LABEL_LONG_WRAP);
         lv_obj_set_style_text_align(mochi_chat_label_, LV_TEXT_ALIGN_CENTER, 0);
         lv_obj_set_style_text_color(mochi_chat_label_, lv_color_hex(0x26364D), 0);
@@ -230,6 +516,9 @@ private:
 
         lv_obj_add_flag(mochi_chat_bubble_, LV_OBJ_FLAG_HIDDEN);
         lv_obj_move_foreground(mochi_chat_bubble_);
+
+        CreateHudLvgl(screen);
+        CreateMenuLvgl(screen);
         Unlock();
     }
 
@@ -281,17 +570,16 @@ private:
             lie_weight = 40;
             sleep_weight = 20;
             idle_weight = 5;
-        // Hunger also suppresses energetic wandering, but less strongly than
+        // Low Fullness suppresses energetic wandering, but less strongly than
         // true low Energy so hunger and fatigue remain visually distinguishable.
-        } else if (pet.hunger >= 75) {
+        } else if (pet.fullness <= 24) {
             walk_weight = 18;
             sit_weight = 38;
             lie_weight = 24;
             sleep_weight = 10;
             idle_weight = 10;
-        // A happy, well-rested Mochi is more lively. No new asset is required;
-        // we express this only through the stable Fix14 walk/idle set.
-        } else if (pet.mood >= 80 && pet.energy >= 50 && pet.hunger < 70) {
+        // A happy, well-rested and well-fed Mochi is more lively.
+        } else if (pet.mood >= 80 && pet.energy >= 50 && pet.fullness > 29) {
             walk_weight = 60;
             sit_weight = 12;
             lie_weight = 8;
@@ -299,10 +587,8 @@ private:
             idle_weight = 16;
         }
 
-        // Friendship is a light long-term bias, not a dominant state. Higher
-        // friendship slightly favors active/attentive behavior without making
-        // low Energy or hunger disappear.
-        if (pet.friendship >= 60 && pet.energy > 35 && pet.hunger < 75) {
+        // Friendship is a light long-term bias, not a dominant state.
+        if (pet.friendship >= 60 && pet.energy > 35 && pet.fullness > 24) {
             walk_weight += 4;
             idle_weight += 4;
             sit_weight = std::max(6, sit_weight - 4);
@@ -313,6 +599,8 @@ private:
         int roll = static_cast<int>(esp_random() % static_cast<uint32_t>(total_weight));
 
         if (roll < walk_weight) {
+            // The 80px Mochi sprite at +50 ends around x=232 on a 284px screen;
+            // HUD begins around x=244, leaving a physical gap between them.
             const int positions[] = {-50, -25, 0, 25, 50};
             mochi_target_x_ = positions[esp_random() % 5];
             if (mochi_target_x_ == mochi_x_) {
@@ -430,6 +718,19 @@ private:
     }
 
     void AmbientTickLvgl() {
+        ProcessMenuRequestsLvgl();
+
+        if (++hud_refresh_ticks_ >= kHudRefreshTicks) {
+            hud_refresh_ticks_ = 0;
+            RefreshHudLvgl();
+        }
+
+        // Menu is a foreground interaction mode; pause decorative movement while
+        // it is open but keep HUD/menu refresh alive.
+        if (menu_open_.load()) {
+            return;
+        }
+
         if (Application::GetInstance().GetDeviceState() != kDeviceStateIdle) {
             idle_stable_ticks_ = 0;
             action_ticks_left_ = 8;
@@ -502,6 +803,24 @@ public:
         }
     }
 
+    // Thread-safe button-facing API. No caller outside LVGL touches LVGL objects.
+    void RequestMenuToggle() {
+        menu_toggle_requested_.store(true);
+    }
+
+    void RequestMenuMove(int delta) {
+        if (delta == 0) return;
+        menu_move_requested_.fetch_add(delta);
+    }
+
+    void RequestMenuSelect() {
+        menu_select_requested_.store(true);
+    }
+
+    bool IsMenuOpen() const {
+        return menu_open_.load();
+    }
+
     void SetChatMessage(const char* role, const char* content) override {
         if (mochi_chat_bubble_ == nullptr || mochi_chat_label_ == nullptr) return;
         if (!Lock(1000)) return;
@@ -522,8 +841,11 @@ public:
             }
             lv_label_set_text(mochi_chat_label_, content);
             lv_obj_remove_flag(mochi_chat_bubble_, LV_OBJ_FLAG_HIDDEN);
-            lv_obj_align(mochi_chat_bubble_, LV_ALIGN_TOP_MID, 0, 48);
+            lv_obj_align(mochi_chat_bubble_, LV_ALIGN_TOP_MID, -10, 48);
             lv_obj_move_foreground(mochi_chat_bubble_);
+            if (hud_panel_ != nullptr) {
+                lv_obj_move_foreground(hud_panel_);
+            }
         }
 
         Unlock();
