@@ -115,28 +115,18 @@ jobs:
               raise SystemExit(f'{p}: pet include anchor count={text.count(old)}')
           text = text.replace(old, new, 1)
 
-          old = '''        if (bits & MAIN_EVENT_CLOCK_TICK) {
-            clock_ticks_++;
-            auto display = Board::GetInstance().GetDisplay();
-            display->UpdateStatusBar();
-        
-            // Print the debug info every 10 seconds'''
-          new = '''        if (bits & MAIN_EVENT_CLOCK_TICK) {
-            clock_ticks_++;
-            auto display = Board::GetInstance().GetDisplay();
-            display->UpdateStatusBar();
+          anchor = '            display->UpdateStatusBar();'
+          if text.count(anchor) != 1:
+              raise SystemExit(f'{p}: status-bar anchor count={text.count(anchor)}')
+          lifecycle = '''            display->UpdateStatusBar();
 
             // Pet lifecycle work belongs on the Application main loop, never
             // the 200ms LVGL timer. Every five idle seconds is ample for state
             // drift, auto sleep/wake, and coalesced NVS checkpoints.
             if (device_state_ == kDeviceStateIdle && clock_ticks_ % 5 == 0) {
                 PetStateEngine::GetInstance().ServiceIdleLifecycle();
-            }
-        
-            // Print the debug info every 10 seconds'''
-          if text.count(old) != 1:
-              raise SystemExit(f'{p}: clock lifecycle anchor count={text.count(old)}')
-          text = text.replace(old, new, 1)
+            }'''
+          text = text.replace(anchor, lifecycle, 1)
           p.write_text(text, encoding='utf-8')
           PY
 
@@ -197,14 +187,11 @@ jobs:
           grep -n "pet.mood >= 80" "$H"
           grep -n "pet.friendship >= 60" "$H"
 
-          # Pet core remains logic/persistence only.
           if grep -nE "xTaskCreate|lv_|esp_sntp|http|websocket" "$P"; then
             echo "Pet core must not own tasks, LVGL, SNTP, or network work"
             exit 1
           fi
 
-          # Persistent lifecycle may write NVS only from Application main loop;
-          # the LVGL display layer must never call Sleep/Wake/Save methods.
           if grep -nE "\.Sleep\(|\.Wake\(|SaveNow\(|ServiceIdleLifecycle" "$H"; then
             echo "LVGL layer must be read-only with respect to persistent pet state"
             exit 1
@@ -265,7 +252,7 @@ jobs:
           Hardware regression test:
           1. APP-only flash without erase; Wi-Fi/NVS must remain.
           2. Boot normally; no reboot loop/Guru Meditation.
-          3. 10-20 voice Q&A exchanges.
+          3. Run 10-20 voice Q&A exchanges.
           4. Interrupt TTS with Talk; it must immediately listen.
           5. Leave idle 15-30 minutes and verify background/movement stay smooth.
           6. Repeat 15B Wi-Fi outage recovery test if convenient.
