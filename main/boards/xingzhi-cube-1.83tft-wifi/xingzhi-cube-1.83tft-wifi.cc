@@ -1,6 +1,7 @@
 #include "wifi_board.h"
 #include "codecs/no_audio_codec.h"
 #include "mochi_lcd_display.h"
+#include "pet/pet_state_engine.h"
 #ifdef CONFIG_SD_CARD_MMC_INTERFACE
 #include "sdmmc.h"
 #elif defined(CONFIG_SD_CARD_SPI_INTERFACE)
@@ -63,6 +64,10 @@ private:
         });
         power_save_timer_->OnShutdownRequest([this]() {
             ESP_LOGI(TAG, "Shutting down");
+            // Controlled shutdown is a safe place for a pet-state checkpoint.
+            // SaveNow() is a no-op when nothing changed, so normal flash wear
+            // remains negligible.
+            PetStateEngine::GetInstance().SaveNow();
             rtc_gpio_set_level(GPIO_NUM_21, 0);
             rtc_gpio_hold_en(GPIO_NUM_21);
             esp_lcd_panel_disp_on_off(panel_, false);
@@ -186,6 +191,7 @@ public:
         InitializeSpi();
         InitializeButtons();
         InitializeSt7789Display();
+        PetStateEngine::GetInstance().Initialize();
         GetBacklight()->SetBrightness(MOCHI_BACKLIGHT_PERCENT, false);
     }
 
