@@ -21,7 +21,14 @@ public:
         uint8_t friendship = 10;  // long-term relationship, does not decay
         int32_t coins = 50;       // future minigame/food economy
         bool sleeping = false;
+        bool manual_sleep = false;
         int32_t last_interaction_epoch = 0;
+    };
+
+    enum class LifecycleTransition : uint8_t {
+        None = 0,
+        AutoSleep,
+        AutoWake,
     };
 
     static PetStateEngine& GetInstance() {
@@ -49,9 +56,10 @@ public:
         TryReconcileOfflineSleepLocked();
 
         ESP_LOGI(kTag,
-                 "Pet core ready H=%u E=%u M=%u F=%u coins=%ld sleep=%d",
+                 "Pet core ready H=%u E=%u M=%u F=%u coins=%ld sleep=%d manual=%d",
                  state_.hunger, state_.energy, state_.mood, state_.friendship,
-                 static_cast<long>(state_.coins), state_.sleeping ? 1 : 0);
+                 static_cast<long>(state_.coins), state_.sleeping ? 1 : 0,
+                 state_.manual_sleep ? 1 : 0);
     }
 
     Snapshot GetSnapshot() {
@@ -79,14 +87,18 @@ public:
         state_.mood = AddClamp(state_.mood, mood_bonus);
         state_.friendship = AddClamp(state_.friendship, 1);
         state_.sleeping = false;
+        state_.manual_sleep = false;
         TouchInteractionLocked();
         dirty_ = true;
-        CheckpointIfDueLocked();
+
+        // Feeding changes both coins and core pet state, so persist it like
+        // Play rather than allowing a reboot to refund the transaction.
+        SaveLocked(esp_timer_get_time());
         return true;
     }
 
-    // 15B basic Play action. There is intentionally no minigame here yet:
-    // Play simply makes Mochi happier and spends a small amount of Energy.
+    // Basic Play action. There is intentionally no minigame here yet: Play
+    // simply makes Mochi happier and spends a small amount of Energy.
     bool Play(uint8_t energy_cost = 10, uint8_t mood_bonus = 10) {
         std::lock_guard<std::mutex> lock(mutex_);
         EnsureInitializedLocked();
@@ -147,15 +159,17 @@ public:
         CheckpointIfDueLocked();
     }
 
+    // Manual Sleep is distinct from automatic exhaustion sleep. A manually
+    // sleeping pet will stay asleep until an explicit Wake() arrives later from
+    // the UI/App. This avoids the auto-wake threshold fighting a Sleep button.
     void Sleep() {
         std::lock_guard<std::mutex> lock(mutex_);
         EnsureInitializedLocked();
         UpdateRuntimeLocked();
-        if (!state_.sleeping) {
+        if (!state_.sleeping || !state_.manual_sleep) {
             state_.sleeping = true;
+            state_.manual_sleep = true;
             dirty_ = true;
-            // Sleep/wake boundaries are rare and semantically important. Save
-            // immediately so a real power loss during sleep can recover Energy.
             SaveLocked(esp_timer_get_time());
         }
     }
@@ -164,11 +178,11 @@ public:
         std::lock_guard<std::mutex> lock(mutex_);
         EnsureInitializedLocked();
         UpdateRuntimeLocked();
-        if (state_.sleeping) {
+        if (state_.sleeping || state_.manual_sleep) {
             state_.sleeping = false;
+            state_.manual_sleep = false;
             TouchInteractionLocked();
             dirty_ = true;
-            // Persist awake immediately so power loss cannot grant fake sleep.
             SaveLocked(esp_timer_get_time());
         }
     }
@@ -178,6 +192,37 @@ public:
         EnsureInitializedLocked();
         UpdateRuntimeLocked();
         return !state_.sleeping && state_.energy <= kAutoSleepEnergy;
+    }
+
+    // Called from the Application main loop only while Idle. This is the single
+    // place that advances the persistent sleep lifecycle and periodic checkpoint
+    // work, keeping all NVS writes away from LVGL and audio hot paths.
+    LifecycleTransition ServiceIdleLifecycle() {
+        std::lock_guard<std::mutex> lock(mutex_);
+        EnsureInitializedLocked();
+        UpdateRuntimeLocked();
+
+        if (!state_.sleeping && state_.energy <= kAutoSleepEnergy) {
+            state_.sleeping = true;
+            state_.manual_sleep = false;
+            dirty_ = true;
+            SaveLocked(esp_timer_get_time());
+            ESP_LOGI(kTag, "Auto sleep at Energy=%u", state_.energy);
+            return LifecycleTransition::AutoSleep;
+        }
+
+        if (state_.sleeping && !state_.manual_sleep && state_.energy >= kAutoWakeEnergy) {
+            state_.sleeping = false;
+            state_.manual_sleep = false;
+            TouchInteractionLocked();
+            dirty_ = true;
+            SaveLocked(esp_timer_get_time());
+            ESP_LOGI(kTag, "Auto wake at Energy=%u", state_.energy);
+            return LifecycleTransition::AutoWake;
+        }
+
+        CheckpointIfDueLocked();
+        return LifecycleTransition::None;
     }
 
     bool CanAfford(int32_t price) {
@@ -223,6 +268,7 @@ private:
     static constexpr int64_t kNormalSaveIntervalUs = 10LL * 60 * 1000 * 1000;
     static constexpr int32_t kMaxCoins = 999999;
     static constexpr uint8_t kAutoSleepEnergy = 20;
+    static constexpr uint8_t kAutoWakeEnergy = 90;
 
     // Hunger changes gently. Energy never changes merely because Mochi is
     // awake: activities spend it, and only logical Sleep restores it slowly.
@@ -281,6 +327,9 @@ private:
         if (s.sleeping) {
             packed |= (1u << 28);
         }
+        if (s.manual_sleep) {
+            packed |= (1u << 29);
+        }
         return packed;
     }
 
@@ -290,6 +339,7 @@ private:
         s.mood = static_cast<uint8_t>(std::min<uint32_t>(100, (packed >> 14) & 0x7F));
         s.friendship = static_cast<uint8_t>(std::min<uint32_t>(100, (packed >> 21) & 0x7F));
         s.sleeping = ((packed >> 28) & 0x01) != 0;
+        s.manual_sleep = s.sleeping && (((packed >> 29) & 0x01) != 0);
     }
 
     void LoadLocked() {
