@@ -1,0 +1,119 @@
+name: Build Mochi Action Art Polish 15M
+
+on:
+  push:
+    branches:
+      - mochi-action-art-polish-15m
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build Mochi Action Art Polish 15M
+    runs-on: ubuntu-latest
+    container:
+      image: espressif/idf:v5.5.1
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Prepare hardware-PASS baseline plus 15M art
+        shell: bash
+        run: python scripts/prepare_mochi_15m.py
+
+      - name: Verify 15M invariants
+        shell: bash
+        run: |
+          H=main/boards/xingzhi-cube-1.83tft-wifi/mochi_lcd_display.h
+          HUD=main/boards/xingzhi-cube-1.83tft-wifi/mochi_hud_icon_assets.h
+          ACT=main/boards/xingzhi-cube-1.83tft-wifi/mochi_action_assets_15l.h
+          P=main/pet/pet_state_engine.h
+          B=main/boards/xingzhi-cube-1.83tft-wifi/xingzhi-cube-1.83tft-wifi.cc
+          W=main/boards/common/wifi_board.cc
+          O=main/ota.h
+          A=main/application.cc
+
+          grep -n 'MOCHI_MENU_LONG_PRESS_MS 1000' "$B"
+          grep -n 'Energy/Mood refined for Mochi 15I' "$HUD"
+          grep -n 'kHudRightMarginPx = 2' "$H"
+          grep -n 'FeedFood' "$P"
+          grep -n 'free_day' "$P"
+          grep -n 'Explicit Play wakes Mochi' "$P"
+          grep -n 'bool HasNewVersion() { return false; }' "$O"
+          grep -n 'Saved WiFi is still unavailable' "$W"
+          grep -n 'ServiceIdleLifecycle' "$A"
+          grep -n 'state == kDeviceStateSpeaking' "$B"
+          grep -n 'app.SetDeviceState(kDeviceStateListening)' "$B"
+
+          grep -n '15M replaces rough 15L primitives with polished pixel art' "$ACT"
+          grep -n '56, 30' "$ACT"
+          grep -n '52, 26' "$ACT"
+          grep -n '46, 31' "$ACT"
+          grep -n '42, 44' "$ACT"
+          grep -n 'reaction_base_x_ - 30 + phase \* 10' "$H"
+          grep -n 'const int food_x = reaction_base_x_ + reaction_side_ \* 43' "$H"
+          grep -n 'StepFeedReactionLvgl' "$H"
+          grep -n 'StepPettingReactionLvgl' "$H"
+          grep -n 'StepPlayReactionLvgl' "$H"
+          grep -n 'e == 11' "$H"
+          grep -n 'SetFeedStageLvgl(1)' "$H"
+          grep -n 'SetFeedStageLvgl(2)' "$H"
+          grep -n 'ShowHappyHeartLvgl' "$H"
+          grep -n 'Voice remains absolute priority' "$H"
+
+          if grep -n 'xTaskCreatePinnedToCore\|xTaskCreate(' "$H"; then
+            echo '15M display layer must not add a FreeRTOS task'; exit 1
+          fi
+          if grep -n 'boot_button_.OnClick' "$B"; then
+            echo 'Talk long-press protection regressed'; exit 1
+          fi
+
+      - name: Build firmware
+        shell: bash
+        run: |
+          source $IDF_PATH/export.sh
+          idf.py --version
+          python scripts/release.py xingzhi-cube-1.83tft-wifi --name xingzhi-cube-1.83tft-wifi
+
+      - name: Verify and package APP-only image
+        shell: bash
+        run: |
+          source $IDF_PATH/export.sh
+          set -euo pipefail
+          APP=build/xiaozhi_vn.bin
+          test -f "$APP"
+          APP_SIZE=$(stat -c%s "$APP")
+          APP_LIMIT=$((0x570000))
+          if [ "$APP_SIZE" -ge "$APP_LIMIT" ]; then echo "APP too large"; exit 1; fi
+          echo "APP size: $APP_SIZE / $APP_LIMIT"
+          python -m esptool --chip esp32s3 image_info "$APP"
+          rm -rf flash_package && mkdir flash_package
+          cp "$APP" flash_package/MOCHI_ACTION_ART_15M_APP.bin
+          cp build/xiaozhi_vn.elf flash_package/
+          cp build/xiaozhi_vn.map flash_package/
+          (cd flash_package && sha256sum MOCHI_ACTION_ART_15M_APP.bin > SHA256.txt)
+          cat > flash_package/FLASH_INSTRUCTIONS.txt <<'EOF'
+          MOCHI ACTION ART POLISH 15M - APP ONLY
+
+          Baseline: 15J hardware-PASS + 15K/15L reaction logic.
+          15M changes the reaction artwork and placement only.
+          Flash APP at 0x20000. Do NOT erase flash.
+
+          python -m esptool --chip esp32s3 --port COM5 --baud 921600 write-flash 0x20000 MOCHI_ACTION_ART_15M_APP.bin
+
+          Visual changes:
+          - Replaces the rough hand with a detailed pastel pixel-art hand/cuff.
+          - Replaces heart and sparkle with polished matching art.
+          - Replaces all three food sequences with larger detailed artwork and visible eaten stages.
+          - Mochi itself remains the original 80x80 sprite source, preserving scale and proportions.
+          - Voice stays highest priority; no audio/network/NVS ownership changes.
+          EOF
+
+      - name: Upload APP-only firmware
+        uses: actions/upload-artifact@v4
+        with:
+          name: mochi_action_art_15m_app_${{ github.sha }}
+          path: flash_package/
+          if-no-files-found: error
+          retention-days: 30
