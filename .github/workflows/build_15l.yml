@@ -127,7 +127,6 @@ jobs:
         run: |
           H=main/boards/xingzhi-cube-1.83tft-wifi/mochi_lcd_display.h
           HUD=main/boards/xingzhi-cube-1.83tft-wifi/mochi_hud_icon_assets.h
-          FOOD=main/boards/xingzhi-cube-1.83tft-wifi/mochi_food_assets.h
           ACT=main/boards/xingzhi-cube-1.83tft-wifi/mochi_action_assets_15l.h
           P=main/pet/pet_state_engine.h
           B=main/boards/xingzhi-cube-1.83tft-wifi/xingzhi-cube-1.83tft-wifi.cc
@@ -160,7 +159,7 @@ jobs:
           grep -n 'StepFeedReactionLvgl' "$H"
           grep -n 'StepPettingReactionLvgl' "$H"
           grep -n 'StepPlayReactionLvgl' "$H"
-          grep -n 'reaction_elapsed_ticks_ == 11' "$H"
+          grep -n 'e == 11' "$H"
           grep -n 'SetFeedStageLvgl(1)' "$H"
           grep -n 'SetFeedStageLvgl(2)' "$H"
           grep -n 'kMochiActionHand' "$H"
