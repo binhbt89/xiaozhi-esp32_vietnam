@@ -12,8 +12,9 @@ def replace_once(text: str, old: str, new: str, label: str) -> str:
 
 display = DISPLAY.read_text(encoding="utf-8")
 
-# 15F is applied first. 15G only changes HUD presentation: restore the HUD close
-# to the right edge and swap the LVGL geometry pictograms for true bitmap assets.
+# 15H keeps 15F behavior and the 15G bitmap-art direction, but makes the HUD
+# physically easier to read on the real 1.83-inch panel: 20x20 icons and a taller
+# vertical rail using more of the safe space near the bottom rounded corner.
 display = replace_once(
     display,
     '#include "pet/pet_state_engine.h"',
@@ -26,7 +27,13 @@ display = replace_once(
     "static constexpr int kHudRightMarginPx = 2;",
     "HUD right margin",
 )
-display = display.replace("// 15F HUD:", "// 15G HUD:")
+display = replace_once(
+    display,
+    "static constexpr int kHudBottomSafePx = 22;",
+    "static constexpr int kHudBottomSafePx = 8;",
+    "HUD bottom safe area",
+)
+display = display.replace("// 15F HUD:", "// 15H HUD:")
 
 start = display.find("    lv_obj_t* MakeHudShapeLvgl(")
 end = display.find("    void RefreshHudLvgl(bool force = false) {", start)
@@ -36,9 +43,9 @@ if start < 0 or end < 0:
 new_hud = r'''    void CreateHudIconLvgl(lv_obj_t* row, size_t index) {
         if (index >= kMochiHudIconAssetCount) return;
 
-        // 15G uses immutable 16x16 ARGB bitmap assets. The art is deliberately
-        // pixel-based and palette-matched to Mochi/backgrounds, not a font glyph
-        // and not a collection of runtime LVGL geometry primitives.
+        // 15H uses enlarged immutable 20x20 ARGB bitmap assets. They preserve
+        // the Mochi/background pastel pixel-art language while giving the tiny
+        // physical screen enough pixels to keep the shapes recognizable.
         lv_obj_t* icon = lv_image_create(row);
         lv_image_set_src(icon, kMochiHudIconAssets[index]);
         lv_obj_align(icon, LV_ALIGN_TOP_MID, 0, 0);
@@ -50,7 +57,7 @@ new_hud = r'''    void CreateHudIconLvgl(lv_obj_t* row, size_t index) {
         const int status_h = StatusBarHeightLvgl();
         const int available_h = static_cast<int>(LV_VER_RES) - status_h -
                                 kHudTopGapPx - kHudBottomSafePx;
-        const int panel_h = std::min(168, std::max(156, available_h));
+        const int panel_h = std::min(194, std::max(184, available_h));
 
         hud_panel_ = lv_obj_create(screen);
         lv_obj_set_size(hud_panel_, kHudWidthPx, panel_h);
@@ -58,7 +65,7 @@ new_hud = r'''    void CreateHudIconLvgl(lv_obj_t* row, size_t index) {
                        status_h + kHudTopGapPx);
         lv_obj_set_style_radius(hud_panel_, 8, 0);
         lv_obj_set_style_bg_color(hud_panel_, lv_color_hex(0x17202A), 0);
-        lv_obj_set_style_bg_opa(hud_panel_, static_cast<lv_opa_t>(64), 0);
+        lv_obj_set_style_bg_opa(hud_panel_, static_cast<lv_opa_t>(56), 0);
         lv_obj_set_style_border_width(hud_panel_, 0, 0);
         lv_obj_set_style_pad_all(hud_panel_, 1, 0);
         lv_obj_set_style_pad_row(hud_panel_, 0, 0);
@@ -71,7 +78,7 @@ new_hud = r'''    void CreateHudIconLvgl(lv_obj_t* row, size_t index) {
 
         for (size_t i = 0; i < kHudRowCount; ++i) {
             lv_obj_t* row = lv_obj_create(hud_panel_);
-            lv_obj_set_size(row, 27, 31);
+            lv_obj_set_size(row, 27, 37);
             lv_obj_set_style_bg_opa(row, LV_OPA_TRANSP, 0);
             lv_obj_set_style_border_width(row, 0, 0);
             lv_obj_set_style_pad_all(row, 0, 0);
@@ -88,8 +95,8 @@ new_hud = r'''    void CreateHudIconLvgl(lv_obj_t* row, size_t index) {
             lv_obj_set_style_text_align(hud_value_labels_[i], LV_TEXT_ALIGN_CENTER, 0);
             lv_obj_set_style_text_letter_space(hud_value_labels_[i], -1, 0);
             lv_obj_set_style_text_color(hud_value_labels_[i], lv_color_white(), 0);
-            // 16px icon + compact 14px value, with the value anchored low so
-            // the two elements read as separate stacked units on real hardware.
+            // 20px icon + 14px value in a 37px row leaves a visible gap while
+            // keeping the HUD as one narrow icon-above-number column.
             lv_obj_align(hud_value_labels_[i], LV_ALIGN_BOTTOM_MID, 0, 1);
         }
 
@@ -100,4 +107,4 @@ new_hud = r'''    void CreateHudIconLvgl(lv_obj_t* row, size_t index) {
 
 display = display[:start] + new_hud + display[end:]
 DISPLAY.write_text(display, encoding="utf-8")
-print("Applied Mochi 15G: close-right HUD with pastel bitmap image assets")
+print("Applied Mochi 15H: 20x20 bitmap HUD icons with taller right-side rail")
