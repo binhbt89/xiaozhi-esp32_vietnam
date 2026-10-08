@@ -1,0 +1,126 @@
+name: Build Mochi Full Food Stage Redraw 15R
+
+on:
+  push:
+    branches:
+      - mochi-full-food-stage-redraw-15r
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build Mochi Full Food Stage Redraw 15R
+    runs-on: ubuntu-latest
+    container:
+      image: espressif/idf:v5.5.1
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Prepare hardware-PASS baseline plus 15R full food stages
+        shell: bash
+        run: python scripts/prepare_mochi_15r.py
+
+      - name: Verify 15R vessel lock and stable foundations
+        shell: bash
+        run: |
+          set -euo pipefail
+          H=main/boards/xingzhi-cube-1.83tft-wifi/mochi_lcd_display.h
+          ACT=main/boards/xingzhi-cube-1.83tft-wifi/mochi_action_food_assets_15q.h
+          P=main/pet/pet_state_engine.h
+          B=main/boards/xingzhi-cube-1.83tft-wifi/xingzhi-cube-1.83tft-wifi.cc
+          W=main/boards/common/wifi_board.cc
+          O=main/ota.h
+          A=main/application.cc
+
+          grep -n 'MOCHI_MENU_LONG_PRESS_MS 1000' "$B"
+          grep -n 'FeedFood' "$P"
+          grep -n 'free_day' "$P"
+          grep -n 'Explicit Play wakes Mochi' "$P"
+          grep -n 'coin300' "$P"
+          grep -n 'bool HasNewVersion() { return false; }' "$O"
+          grep -n 'Saved WiFi is still unavailable' "$W"
+          grep -n 'ServiceIdleLifecycle' "$A"
+          grep -n 'state == kDeviceStateSpeaking' "$B"
+          grep -n 'app.SetDeviceState(kDeviceStateListening)' "$B"
+
+          grep -n 'Mochi 15R FULL FOOD STAGES' "$ACT"
+          grep -n 'Plate/bowl/cup pixels are locked across stages' "$ACT"
+          COUNT=$(grep -c 'LV_COLOR_FORMAT_ARGB8888, 0, 68, 54, 272, 0' "$ACT")
+          test "$COUNT" -eq 9
+          grep -n 'mochi_action_15r_fish0' "$ACT"
+          grep -n 'mochi_action_15r_fish1' "$ACT"
+          grep -n 'mochi_action_15r_fish2' "$ACT"
+          grep -n 'mochi_action_15r_meal0' "$ACT"
+          grep -n 'mochi_action_15r_meal1' "$ACT"
+          grep -n 'mochi_action_15r_meal2' "$ACT"
+          grep -n 'mochi_action_15r_dessert0' "$ACT"
+          grep -n 'mochi_action_15r_dessert1' "$ACT"
+          grep -n 'mochi_action_15r_dessert2' "$ACT"
+          grep -n 'kMochiActionFoodStages15Q' "$ACT"
+
+          # Keep 15Q/15P geometry and animation behavior; 15R changes only food pixels.
+          grep -n 'reaction_side_ = (mochi_x_ > 8) ? -1 : 1;' "$H"
+          grep -n 'reaction_side_ \* 66' "$H"
+          grep -n 'food_x, 64' "$H"
+          grep -n 'lv_image_set_scale(obj, LV_SCALE_NONE)' "$H"
+          if grep -n 'mouth_fx_x' "$H"; then
+            echo '15R regression: bite sparkle returned'; exit 1
+          fi
+          if grep -n 'xTaskCreatePinnedToCore\|xTaskCreate(' "$H"; then
+            echo '15R display layer must not add a FreeRTOS task'; exit 1
+          fi
+          if grep -n 'boot_button_.OnClick' "$B"; then
+            echo 'Talk long-press protection regressed'; exit 1
+          fi
+
+      - name: Build firmware
+        shell: bash
+        run: |
+          source $IDF_PATH/export.sh
+          idf.py --version
+          python scripts/release.py xingzhi-cube-1.83tft-wifi --name xingzhi-cube-1.83tft-wifi
+
+      - name: Verify and package APP-only image
+        shell: bash
+        run: |
+          source $IDF_PATH/export.sh
+          set -euo pipefail
+          APP=build/xiaozhi_vn.bin
+          test -f "$APP"
+          APP_SIZE=$(stat -c%s "$APP")
+          APP_LIMIT=$((0x570000))
+          if [ "$APP_SIZE" -ge "$APP_LIMIT" ]; then echo "APP too large"; exit 1; fi
+          echo "APP size: $APP_SIZE / $APP_LIMIT"
+          python -m esptool --chip esp32s3 image_info "$APP"
+          rm -rf flash_package && mkdir flash_package
+          cp "$APP" flash_package/MOCHI_FULL_FOOD_STAGES_15R_APP.bin
+          cp build/xiaozhi_vn.elf flash_package/
+          cp build/xiaozhi_vn.map flash_package/
+          (cd flash_package && sha256sum MOCHI_FULL_FOOD_STAGES_15R_APP.bin > SHA256.txt)
+          cat > flash_package/FLASH_INSTRUCTIONS.txt <<'EOF'
+          MOCHI FULL FOOD STAGES 15R - APP ONLY
+
+          Baseline: 15Q clean uncropped food + 15P/15Q stable reaction geometry.
+          Flash APP at 0x20000. Do NOT erase flash.
+
+          python -m esptool --chip esp32s3 --port COM5 --baud 921600 write-flash 0x20000 MOCHI_FULL_FOOD_STAGES_15R_APP.bin
+
+          15R fixes:
+          - Keeps 15Q artwork/placement that already removed crop and jump bugs.
+          - Uses 9 complete standalone food frames; no runtime erase/subtract operation.
+          - Fish plate, meal bowl, and dessert cup vessel regions are copied byte-for-byte from stage 0 into stages 1/2.
+          - Vessel color/shape therefore cannot disappear between bites.
+          - Only edible content changes between stages.
+          - Existing +300 one-time test coin migration is preserved; it is NOT granted again if coin300 is already stored in NVS.
+          - Voice/Wi-Fi/audio/OTA/NVS architecture is unchanged.
+          EOF
+
+      - name: Upload APP-only firmware
+        uses: actions/upload-artifact@v4
+        with:
+          name: mochi_full_food_stages_15r_app_${{ github.sha }}
+          path: flash_package/
+          if-no-files-found: error
+          retention-days: 30
