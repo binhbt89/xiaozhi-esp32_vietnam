@@ -1,4 +1,4 @@
-name: Build Mochi Action Art Polish 15M
+name: Build Mochi Action Placement Polish 15N
 
 on:
   push:
@@ -10,7 +10,7 @@ permissions:
 
 jobs:
   build:
-    name: Build Mochi Action Art Polish 15M
+    name: Build Mochi Action Placement Polish 15N
     runs-on: ubuntu-latest
     container:
       image: espressif/idf:v5.5.1
@@ -18,11 +18,11 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Prepare hardware-PASS baseline plus 15M art
+      - name: Prepare hardware-PASS baseline plus 15N placement polish
         shell: bash
         run: python scripts/prepare_mochi_15m.py
 
-      - name: Verify 15M invariants
+      - name: Verify 15N invariants
         shell: bash
         run: |
           H=main/boards/xingzhi-cube-1.83tft-wifi/mochi_lcd_display.h
@@ -46,24 +46,38 @@ jobs:
           grep -n 'state == kDeviceStateSpeaking' "$B"
           grep -n 'app.SetDeviceState(kDeviceStateListening)' "$B"
 
+          # Keep the polished 15M art dimensions.
           grep -n '15M replaces rough 15L primitives with polished pixel art' "$ACT"
           grep -n '56, 30' "$ACT"
           grep -n '52, 26' "$ACT"
           grep -n '46, 31' "$ACT"
           grep -n '42, 44' "$ACT"
-          grep -n 'reaction_base_x_ - 30 + phase \* 10' "$H"
-          grep -n 'const int food_x = reaction_base_x_ + reaction_side_ \* 43' "$H"
+
+          # 15N geometry: food beside Mochi on the same visual baseline,
+          # hand physically touching the head, heart enlarged and lowered.
+          grep -n 'reaction_base_x_ - 18 + phase \* 8' "$H"
+          grep -n 'const int hand_y = (phase == 2) ? 18 : 15' "$H"
+          grep -n 'const int food_x = reaction_base_x_ + reaction_side_ \* 58' "$H"
+          grep -n 'food_x, 58);' "$H"
+          grep -n 'lv_image_set_scale(reaction_aux_, 320)' "$H"
+          grep -n 'ShowHappyHeartLvgl(reaction_base_x_, 10)' "$H"
+
           grep -n 'StepFeedReactionLvgl' "$H"
           grep -n 'StepPettingReactionLvgl' "$H"
           grep -n 'StepPlayReactionLvgl' "$H"
           grep -n 'e == 11' "$H"
           grep -n 'SetFeedStageLvgl(1)' "$H"
           grep -n 'SetFeedStageLvgl(2)' "$H"
-          grep -n 'ShowHappyHeartLvgl' "$H"
           grep -n 'Voice remains absolute priority' "$H"
 
+          if grep -n 'mouth_fx_x' "$H"; then
+            echo '15N bite animation must not show the old bite sparkle'; exit 1
+          fi
+          if grep -n 'SetReactionImageLvgl(reaction_aux_, kMochiActionSparkle' "$H"; then
+            echo '15N bite sparkle path still present'; exit 1
+          fi
           if grep -n 'xTaskCreatePinnedToCore\|xTaskCreate(' "$H"; then
-            echo '15M display layer must not add a FreeRTOS task'; exit 1
+            echo '15N display layer must not add a FreeRTOS task'; exit 1
           fi
           if grep -n 'boot_button_.OnClick' "$B"; then
             echo 'Talk long-press protection regressed'; exit 1
@@ -89,31 +103,31 @@ jobs:
           echo "APP size: $APP_SIZE / $APP_LIMIT"
           python -m esptool --chip esp32s3 image_info "$APP"
           rm -rf flash_package && mkdir flash_package
-          cp "$APP" flash_package/MOCHI_ACTION_ART_15M_APP.bin
+          cp "$APP" flash_package/MOCHI_ACTION_PLACEMENT_15N_APP.bin
           cp build/xiaozhi_vn.elf flash_package/
           cp build/xiaozhi_vn.map flash_package/
-          (cd flash_package && sha256sum MOCHI_ACTION_ART_15M_APP.bin > SHA256.txt)
+          (cd flash_package && sha256sum MOCHI_ACTION_PLACEMENT_15N_APP.bin > SHA256.txt)
           cat > flash_package/FLASH_INSTRUCTIONS.txt <<'EOF'
-          MOCHI ACTION ART POLISH 15M - APP ONLY
+          MOCHI ACTION PLACEMENT POLISH 15N - APP ONLY
 
-          Baseline: 15J hardware-PASS + 15K/15L reaction logic.
-          15M changes the reaction artwork and placement only.
-          Flash APP at 0x20000. Do NOT erase flash.
+          Baseline: 15J hardware-PASS + 15K/15L reaction logic + 15M polished action art.
+          15N changes placement/timing presentation only. Flash APP at 0x20000. Do NOT erase flash.
 
-          python -m esptool --chip esp32s3 --port COM5 --baud 921600 write-flash 0x20000 MOCHI_ACTION_ART_15M_APP.bin
+          python -m esptool --chip esp32s3 --port COM5 --baud 921600 write-flash 0x20000 MOCHI_ACTION_PLACEMENT_15N_APP.bin
 
-          Visual changes:
-          - Replaces the rough hand with a detailed pastel pixel-art hand/cuff.
-          - Replaces heart and sparkle with polished matching art.
-          - Replaces all three food sequences with larger detailed artwork and visible eaten stages.
-          - Mochi itself remains the original 80x80 sprite source, preserving scale and proportions.
-          - Voice stays highest priority; no audio/network/NVS ownership changes.
+          15N visual fixes:
+          - Food is moved to Mochi's side on almost the same baseline instead of floating diagonally above it.
+          - Food placement is kept inside the safe scene area for the full -50..50 walk range and the right HUD.
+          - Petting hand is lowered and moved inward so the fingers actually cross Mochi's forehead/crown for all three strokes.
+          - Happy heart is enlarged from 30x30 to ~38x38 at render time and moved close to Mochi's head.
+          - Bite sparkle is removed: eating now reads as bite motion -> food shrinks -> happy finish.
+          - Original Mochi sprite scale/proportions, voice priority, Wi-Fi, audio, OTA and NVS behavior are unchanged.
           EOF
 
       - name: Upload APP-only firmware
         uses: actions/upload-artifact@v4
         with:
-          name: mochi_action_art_15m_app_${{ github.sha }}
+          name: mochi_action_placement_15n_app_${{ github.sha }}
           path: flash_package/
           if-no-files-found: error
           retention-days: 30
