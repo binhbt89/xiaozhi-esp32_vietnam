@@ -20,7 +20,7 @@ s = DISPLAY.read_text(encoding='utf-8')
 # 15N currently uses 58px side offset / y58. The 68px-wide fixed canvas uses a
 # 66px center offset: at reaction_base_x <= 8 its right edge remains <=250,
 # otherwise the food flips left. Across the full -50..50 walk range, bounds are
-# x=51..248 or x=92..160 on the opposite side. Vertically y=157..211.
+# safely inside the scene. Vertically the 54px canvas spans y=157..211.
 s = one(s,
         'reaction_side_ = (mochi_x_ >= 20) ? -1 : 1;',
         'reaction_side_ = (mochi_x_ > 8) ? -1 : 1;',
@@ -74,33 +74,31 @@ p = one(p,
     bool offline_sleep_reconciled_ = false;''',
         'coin grant field')
 
-# Call the migration after loading persisted state in both initialization paths.
-p = one(p,
-'''        LoadLocked();
-        last_monotonic_us_ = esp_timer_get_time();''',
-'''        LoadLocked();
-        ApplyOneTimeTestCoinGrantLocked();
-        last_monotonic_us_ = esp_timer_get_time();''',
-        'public initialize grant')
+# Public Initialize() path.
 p = one(p,
 '''        LoadLocked();
         last_monotonic_us_ = esp_timer_get_time();
         last_save_monotonic_us_ = last_monotonic_us_;
         initialized_ = true;
-        TryReconcileOfflineSleepLocked();''',
-'''        LoadLocked();
-        ApplyOneTimeTestCoinGrantLocked();
-        last_monotonic_us_ = esp_timer_get_time();
-        last_save_monotonic_us_ = last_monotonic_us_;
-        initialized_ = true;
-        TryReconcileOfflineSleepLocked();''',
-        'lazy initialize grant')
 
-# 15J adds these daily-free fields after reconstruction; append the helper right
-# before EnsureInitializedLocked so it is private and lock-owned.
+        // On this board PetStateEngine starts before the OTA/bootstrap path may''',
+'''        LoadLocked();
+        ApplyOneTimeTestCoinGrantLocked();
+        last_monotonic_us_ = esp_timer_get_time();
+        last_save_monotonic_us_ = last_monotonic_us_;
+        initialized_ = true;
+
+        // On this board PetStateEngine starts before the OTA/bootstrap path may''',
+        'public initialize grant')
+
+# Add the helper immediately before the lazy initialization path.
 p = one(p,
 '''    void EnsureInitializedLocked() {
-''',
+        if (initialized_) {
+            return;
+        }
+        LoadLocked();
+        last_monotonic_us_ = esp_timer_get_time();''',
 '''    void ApplyOneTimeTestCoinGrantLocked() {
         if (test_coin_grant_applied_) return;
         state_.coins = std::min<int32_t>(kMaxCoins, state_.coins + 300);
@@ -112,8 +110,13 @@ p = one(p,
     }
 
     void EnsureInitializedLocked() {
-''',
-        'coin grant helper')
+        if (initialized_) {
+            return;
+        }
+        LoadLocked();
+        ApplyOneTimeTestCoinGrantLocked();
+        last_monotonic_us_ = esp_timer_get_time();''',
+        'lazy initialize grant')
 
 # Load the migration flag. 15J already introduces free_day/free_mask here.
 p = one(p,
