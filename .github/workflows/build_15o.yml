@@ -1,0 +1,123 @@
+name: Build Mochi Action Asset Alignment 15O
+
+on:
+  push:
+    branches:
+      - mochi-action-rgb565-align-15o
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build Mochi Action Asset Alignment 15O
+    runs-on: ubuntu-latest
+    container:
+      image: espressif/idf:v5.5.1
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Prepare hardware-PASS baseline plus 15O assets
+        shell: bash
+        run: python scripts/prepare_mochi_15o.py
+
+      - name: Verify 15O geometry and palette invariants
+        shell: bash
+        run: |
+          set -euo pipefail
+          H=main/boards/xingzhi-cube-1.83tft-wifi/mochi_lcd_display.h
+          ACT=main/boards/xingzhi-cube-1.83tft-wifi/mochi_action_assets_15l.h
+          P=main/pet/pet_state_engine.h
+          B=main/boards/xingzhi-cube-1.83tft-wifi/xingzhi-cube-1.83tft-wifi.cc
+          W=main/boards/common/wifi_board.cc
+          O=main/ota.h
+          A=main/application.cc
+
+          # Stable foundations must still be present.
+          grep -n 'MOCHI_MENU_LONG_PRESS_MS 1000' "$B"
+          grep -n 'FeedFood' "$P"
+          grep -n 'free_day' "$P"
+          grep -n 'Explicit Play wakes Mochi' "$P"
+          grep -n 'bool HasNewVersion() { return false; }' "$O"
+          grep -n 'Saved WiFi is still unavailable' "$W"
+          grep -n 'ServiceIdleLifecycle' "$A"
+          grep -n 'state == kDeviceStateSpeaking' "$B"
+          grep -n 'app.SetDeviceState(kDeviceStateListening)' "$B"
+
+          # 15O: exact fixed-canvas and safe placement.
+          grep -n 'Every food frame is EXACTLY 64x48' "$ACT"
+          COUNT=$(grep -c 'LV_COLOR_FORMAT_ARGB8888, 0, 64, 48, 256, 0' "$ACT")
+          test "$COUNT" -eq 9
+          grep -n 'reaction_side_ = (mochi_x_ > 8) ? -1 : 1;' "$H"
+          grep -n 'reaction_side_ \* 68' "$H"
+          grep -n 'food_x, 64' "$H"
+          grep -n 'lv_image_set_scale(obj, LV_SCALE_NONE)' "$H"
+          grep -n 'ShowHappyHeartLvgl(reaction_base_x_, 6)' "$H"
+          grep -n 'reaction_base_x_ - 14 + phase \* 7' "$H"
+
+          # Bite animation must not resurrect the unrelated sparkle effect.
+          if grep -n 'mouth_fx_x' "$H"; then
+            echo '15O regression: bite sparkle coordinate returned'; exit 1
+          fi
+          if grep -n 'lv_image_set_scale(reaction_aux_, 320)' "$H"; then
+            echo '15O regression: interpolated heart scaling returned'; exit 1
+          fi
+          if grep -n 'xTaskCreatePinnedToCore\|xTaskCreate(' "$H"; then
+            echo '15O display layer must not add a FreeRTOS task'; exit 1
+          fi
+          if grep -n 'boot_button_.OnClick' "$B"; then
+            echo 'Talk long-press protection regressed'; exit 1
+          fi
+
+      - name: Build firmware
+        shell: bash
+        run: |
+          source $IDF_PATH/export.sh
+          idf.py --version
+          python scripts/release.py xingzhi-cube-1.83tft-wifi --name xingzhi-cube-1.83tft-wifi
+
+      - name: Verify and package APP-only image
+        shell: bash
+        run: |
+          source $IDF_PATH/export.sh
+          set -euo pipefail
+          APP=build/xiaozhi_vn.bin
+          test -f "$APP"
+          APP_SIZE=$(stat -c%s "$APP")
+          APP_LIMIT=$((0x570000))
+          if [ "$APP_SIZE" -ge "$APP_LIMIT" ]; then echo "APP too large"; exit 1; fi
+          echo "APP size: $APP_SIZE / $APP_LIMIT"
+          python -m esptool --chip esp32s3 image_info "$APP"
+          rm -rf flash_package && mkdir flash_package
+          cp "$APP" flash_package/MOCHI_ACTION_ALIGN_RGB565_15O_APP.bin
+          cp build/xiaozhi_vn.elf flash_package/
+          cp build/xiaozhi_vn.map flash_package/
+          (cd flash_package && sha256sum MOCHI_ACTION_ALIGN_RGB565_15O_APP.bin > SHA256.txt)
+          cat > flash_package/FLASH_INSTRUCTIONS.txt <<'EOF'
+          MOCHI ACTION ALIGN + RGB565 PALETTE 15O - APP ONLY
+
+          Baseline: 15J hardware-PASS pet/economy + 15K/15L reaction logic + 15N placement corrections.
+          Flash APP at 0x20000. Do NOT erase flash.
+
+          python -m esptool --chip esp32s3 --port COM5 --baud 921600 write-flash 0x20000 MOCHI_ACTION_ALIGN_RGB565_15O_APP.bin
+
+          15O fixes:
+          - All 9 food frames are the SAME 64x48 canvas and same bottom-center anchor.
+          - Stage changes no longer resize/re-anchor the LVGL image object, eliminating bite-to-bite jumps.
+          - Food placement is calculated for the 284x240 scene, 80x80 Mochi, full -50..50 walk range and right HUD safe edge.
+          - Food canvas stays within x=28..250 and y=160..208.
+          - Action art uses a small hard-edged palette with binary alpha only; no soft anti-alias/partial transparency.
+          - Heart is native 38x38; no runtime interpolation scaling.
+          - Reaction images reset LVGL scale on every source change to prevent transform leakage.
+          - Bite sparkle remains removed; Play may still use the small crisp sparkle at its happy finish.
+          - Voice/Wi-Fi/audio/NVS/OTA behavior unchanged.
+          EOF
+
+      - name: Upload APP-only firmware
+        uses: actions/upload-artifact@v4
+        with:
+          name: mochi_action_align_rgb565_15o_app_${{ github.sha }}
+          path: flash_package/
+          if-no-files-found: error
+          retention-days: 30
