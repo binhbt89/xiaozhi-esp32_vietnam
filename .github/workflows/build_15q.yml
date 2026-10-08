@@ -1,0 +1,139 @@
+name: Build Mochi Clean Food Assets 15Q
+
+on:
+  push:
+    branches:
+      - mochi-clean-food-assets-15q
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build Mochi Clean Food Assets 15Q
+    runs-on: ubuntu-latest
+    container:
+      image: espressif/idf:v5.5.1
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Prepare hardware-PASS baseline plus 15Q clean food
+        shell: bash
+        run: python scripts/prepare_mochi_15q.py
+
+      - name: Verify 15Q food, geometry and persistence invariants
+        shell: bash
+        run: |
+          set -euo pipefail
+          H=main/boards/xingzhi-cube-1.83tft-wifi/mochi_lcd_display.h
+          ACT=main/boards/xingzhi-cube-1.83tft-wifi/mochi_action_assets_15l.h
+          FOOD=main/boards/xingzhi-cube-1.83tft-wifi/mochi_action_food_assets_15q.h
+          P=main/pet/pet_state_engine.h
+          B=main/boards/xingzhi-cube-1.83tft-wifi/xingzhi-cube-1.83tft-wifi.cc
+          W=main/boards/common/wifi_board.cc
+          O=main/ota.h
+          A=main/application.cc
+
+          # Stable foundations.
+          grep -n 'MOCHI_MENU_LONG_PRESS_MS 1000' "$B"
+          grep -n 'FeedFood' "$P"
+          grep -n 'free_day' "$P"
+          grep -n 'Explicit Play wakes Mochi' "$P"
+          grep -n 'bool HasNewVersion() { return false; }' "$O"
+          grep -n 'Saved WiFi is still unavailable' "$W"
+          grep -n 'ServiceIdleLifecycle' "$A"
+          grep -n 'state == kDeviceStateSpeaking' "$B"
+          grep -n 'app.SetDeviceState(kDeviceStateListening)' "$B"
+
+          # 15P approved hand/heart art remains intact.
+          grep -n 'approved 15M artwork restored' "$ACT"
+          grep -n 'LV_COLOR_FORMAT_ARGB8888, 0, 56, 30, 224, 0' "$ACT"
+          grep -n 'LV_COLOR_FORMAT_ARGB8888, 0, 38, 38, 152, 0' "$ACT"
+
+          # 15Q food is a separate clean source, reconstructed from the uncropped
+          # full approved sheet. The generator itself validates every pixel's
+          # >=2px safety margin, RGB565 grid, binary alpha and <=17-color palette.
+          grep -n '15Q CLEAN FOOD' "$FOOD"
+          COUNT=$(grep -c 'LV_COLOR_FORMAT_ARGB8888, 0, 68, 54, 272, 0' "$FOOD")
+          test "$COUNT" -eq 9
+          grep -n 'kMochiActionFoodStages15Q' "$FOOD"
+          grep -n '#include "mochi_action_food_assets_15q.h"' "$H"
+          grep -n 'kMochiActionFoodStages15Q\[reaction_food_index_\]\[stage\]' "$H"
+
+          # Locked 15P geometry: source changes but placement must not move.
+          grep -n 'reaction_side_ = (mochi_x_ > 8) ? -1 : 1;' "$H"
+          grep -n 'reaction_side_ \* 66' "$H"
+          grep -n 'food_x, 64' "$H"
+          grep -n 'lv_image_set_scale(obj, LV_SCALE_NONE)' "$H"
+          if grep -n 'mouth_fx_x' "$H"; then
+            echo '15Q regression: bite sparkle returned'; exit 1
+          fi
+          if grep -n 'lv_image_set_scale(reaction_aux_, 320)' "$H"; then
+            echo '15Q regression: runtime heart interpolation returned'; exit 1
+          fi
+
+          # Keep 15P one-time +300 test-coin migration.
+          grep -n 'state_.coins + 300' "$P"
+          grep -n 'coin300' "$P"
+          grep -n 'test_coin_grant_applied_' "$P"
+
+          if grep -n 'xTaskCreatePinnedToCore\|xTaskCreate(' "$H"; then
+            echo '15Q display layer must not add a FreeRTOS task'; exit 1
+          fi
+          if grep -n 'boot_button_.OnClick' "$B"; then
+            echo 'Talk long-press protection regressed'; exit 1
+          fi
+
+      - name: Build firmware
+        shell: bash
+        run: |
+          source $IDF_PATH/export.sh
+          idf.py --version
+          python scripts/release.py xingzhi-cube-1.83tft-wifi --name xingzhi-cube-1.83tft-wifi
+
+      - name: Verify and package APP-only image
+        shell: bash
+        run: |
+          source $IDF_PATH/export.sh
+          set -euo pipefail
+          APP=build/xiaozhi_vn.bin
+          test -f "$APP"
+          APP_SIZE=$(stat -c%s "$APP")
+          APP_LIMIT=$((0x570000))
+          if [ "$APP_SIZE" -ge "$APP_LIMIT" ]; then echo "APP too large"; exit 1; fi
+          echo "APP size: $APP_SIZE / $APP_LIMIT"
+          python -m esptool --chip esp32s3 image_info "$APP"
+          rm -rf flash_package && mkdir flash_package
+          cp "$APP" flash_package/MOCHI_CLEAN_FOOD_15Q_APP.bin
+          cp build/xiaozhi_vn.elf flash_package/
+          cp build/xiaozhi_vn.map flash_package/
+          (cd flash_package && sha256sum MOCHI_CLEAN_FOOD_15Q_APP.bin > SHA256.txt)
+          cat > flash_package/FLASH_INSTRUCTIONS.txt <<'EOF'
+          MOCHI CLEAN FOOD ASSETS 15Q - APP ONLY
+
+          Baseline: 15P approved hand/heart reactions + locked fixed-canvas geometry.
+          Flash APP at 0x20000. Do NOT erase flash.
+
+          python -m esptool --chip esp32s3 --port COM5 --baud 921600 write-flash 0x20000 MOCHI_CLEAN_FOOD_15Q_APP.bin
+
+          15Q changes:
+          - Rebuilds ONLY Fish/Meal/Dessert from the full uncropped approved artwork sheet.
+          - Does not reuse the already-cropped 15M food cutouts that caused the missing-corner defect.
+          - All nine stages are independent complete 68x54 canvases with the same bottom-center anchor.
+          - Each finished sprite has >=2 transparent pixels of verified safety padding on every edge.
+          - RGB values are snapped to RGB565, no dithering, <=17 visible colors per frame, binary alpha only.
+          - Food placement remains exactly the tested 15P geometry: x offset 66, y center 64, automatic left/right safe side.
+          - Bite stage changes only the image source; object position/scale stays fixed.
+          - Approved 15P hand, heart and other reaction art remain unchanged.
+          - 15P one-time +300 test-coin migration remains present; its NVS flag prevents repeat grants.
+          - Voice/Wi-Fi/audio/OTA behavior unchanged.
+          EOF
+
+      - name: Upload APP-only firmware
+        uses: actions/upload-artifact@v4
+        with:
+          name: mochi_clean_food_15q_app_${{ github.sha }}
+          path: flash_package/
+          if-no-files-found: error
+          retention-days: 30
