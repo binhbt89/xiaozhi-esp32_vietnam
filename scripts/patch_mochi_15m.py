@@ -59,16 +59,13 @@ s=s.replace('ShowHappyHeartLvgl(reaction_base_x_, -5);',
 # Heart pulse positions must use the same close-to-head baseline instead of
 # jumping back to the old negative-Y coordinates after the first frame.
 n=s.count('reaction_base_x_, -5 - pulse * 2);')
-if n!=2:
-    raise SystemExit(f'pet/play heart pulse: expected 2 matches, got {n}')
+if n!=3:
+    raise SystemExit(f'pet/play/wake heart pulse: expected 3 matches, got {n}')
 s=s.replace('reaction_base_x_, -5 - pulse * 2);',
             'reaction_base_x_, 10 - pulse * 2);')
 one('reaction_base_x_, -3 - pulse * 2);',
     'reaction_base_x_, 10 - pulse * 2);',
     'feed heart pulse')
-one('reaction_base_x_, -5 - pulse * 2);',
-    'reaction_base_x_, 10 - pulse * 2);',
-    'wake heart pulse')
 
 # A sparkle on every bite looked like an unrelated impact effect and could also
 # crowd the food edge. Eating now reads cleanly as: bite motion -> food shrinks.
